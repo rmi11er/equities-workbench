@@ -1,0 +1,42 @@
+[temporal]
+lookahead_days = 7
+lookback_regime_days = 30
+
+[event_types]
+# Priority weights (higher = more prominent)
+earnings = 100
+conference = 80
+analyst_day = 70
+macro = 60
+
+[flags]
+# Stock momentum
+momentum_enabled = true
+momentum_threshold_pct = 30
+momentum_window_days = 90
+
+# Sector relative performance
+sector_relative_enabled = true
+sector_relative_threshold_pct = 10
+sector_relative_window_days = 30
+
+# VIX regime
+vix_enabled = true
+vix_high = 25
+vix_low = 15
+
+# Short interest
+short_interest_enabled = false
+short_interest_percentile = 80
+
+# Consecutive results
+streak_enabled = true
+streak_threshold = 3
+
+# Leadership change
+leadership_change_enabled = true
+leadership_change_lookback_days = 180
+
+[thresholds]
+high_interest_min_flags = 3
+standard_min_flags = 1

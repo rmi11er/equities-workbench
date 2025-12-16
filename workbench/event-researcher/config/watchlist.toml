@@ -1,0 +1,18 @@
+[settings]
+auto_update = false
+
+[equities]
+symbols = [
+    # Mega tech
+    "NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA",
+    # Semiconductors
+    "AMD", "AVGO", "QCOM", "MU", "INTC", "ARM", "MRVL",
+    # Software/Cloud
+    "CRM", "NOW", "ORCL", "ADBE", "SNOW", "PLTR", "NET",
+    # Fintech/Payments
+    "SQ", "PYPL", "COIN", "SHOP", "AFRM",
+    # Consumer
+    "NFLX", "DIS", "NKE", "SBUX", "MCD", "COST",
+    # Other high-interest
+    "GME", "AMC", "SMCI",
+]

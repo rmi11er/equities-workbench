@@ -1,0 +1,19 @@
+[app]
+name = "Event Researcher"
+data_dir = "data"
+database_name = "researcher.duckdb"
+
+[agent]
+default_model = "claude-sonnet-4-20250514"
+complex_model = "claude-opus-4-5-20250514"
+max_tokens = 4096
+temperature = 0.3
+
+[data]
+price_history_years = 5
+hourly_cache_ttl_minutes = 60
+transcript_source_priority = ["seeking_alpha", "fmp"]
+
+[ui]
+theme = "dark"
+monitor_refresh_seconds = 300
