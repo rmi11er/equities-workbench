@@ -7,6 +7,26 @@ quantitative finance strategy validation.
 
 __version__ = "0.1.0"
 
+from moat.utils import (
+    fetch_universe,
+    backtest_strategy,
+    test_robustness,
+    full_strategy_test,
+    print_strategy_report,
+    compare_strategies,
+    print_comparison_table,
+)
+
+__all__ = [
+    "fetch_universe",
+    "backtest_strategy",
+    "test_robustness",
+    "full_strategy_test",
+    "print_strategy_report",
+    "compare_strategies",
+    "print_comparison_table",
+]
+
 
 def main() -> None:
     """CLI entry point."""
