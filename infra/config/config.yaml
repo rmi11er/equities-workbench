@@ -1,0 +1,20 @@
+# The Moat - Configuration
+# Non-sensitive settings. For API keys, use .env
+
+paths:
+  data_incoming: "data/incoming"
+  data_processed: "data/processed"
+  logs: "logs"
+
+data:
+  default_source: "yfinance"  # yfinance | local
+  cache_days: 7               # Days to cache API data locally
+
+backtest:
+  default_initial_capital: 100000.0
+  default_commission_pct: 0.001    # 0.1% per trade
+  default_slippage_pct: 0.0005     # 0.05% slippage
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

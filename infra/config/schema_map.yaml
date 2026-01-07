@@ -1,0 +1,58 @@
+# Schema Mapping for Local Data Ingestion
+# Maps foreign column names to standard OHLCV format
+#
+# Usage: When dropping a CSV into data/incoming/, create an entry here
+# with the filename (without extension) as the key.
+#
+# Standard columns: date, open, high, low, close, volume, adjusted_close (optional)
+
+# Example mappings for common data sources:
+
+bloomberg:
+  # Bloomberg terminal exports
+  date: "Date"
+  open: "PX_OPEN"
+  high: "PX_HIGH"
+  low: "PX_LOW"
+  close: "PX_LAST"
+  volume: "PX_VOLUME"
+  adjusted_close: null
+
+refinitiv:
+  # Refinitiv/Reuters data
+  date: "Trade Date"
+  open: "Open Price"
+  high: "High Price"
+  low: "Low Price"
+  close: "Close Price"
+  volume: "Volume"
+  adjusted_close: "Adjusted Close"
+
+yahoo:
+  # Yahoo Finance CSV exports
+  date: "Date"
+  open: "Open"
+  high: "High"
+  low: "Low"
+  close: "Close"
+  volume: "Volume"
+  adjusted_close: "Adj Close"
+
+generic:
+  # Fallback for simple CSVs (case-insensitive matching)
+  date: "date"
+  open: "open"
+  high: "high"
+  low: "low"
+  close: "close"
+  volume: "volume"
+  adjusted_close: "adj_close"
+
+# Custom mappings: Add your own below
+# my_futures_data:
+#   date: "timestamp"
+#   open: "o"
+#   high: "h"
+#   low: "l"
+#   close: "c"
+#   volume: "vol"
