@@ -52,13 +52,19 @@ class LIPConstraints:
     is_active: bool = True
 
     @classmethod
-    def from_program(cls, program: LIPProgram, min_score_threshold: float = 0.1) -> "LIPConstraints":
+    def from_program(
+        cls,
+        program: LIPProgram,
+        min_score_threshold: float = 0.1,
+        max_tick_cap: int = 20,
+    ) -> "LIPConstraints":
         """
         Derive quoting constraints from LIP program.
 
         Args:
             program: The LIP program
             min_score_threshold: Minimum multiplier to consider worthwhile (default 10%)
+            max_tick_cap: Maximum distance to quote for LIP (capital efficiency)
         """
         # Min size = target size (must meet this to qualify)
         min_size = program.target_size
@@ -67,13 +73,16 @@ class LIPConstraints:
         # (1 - df)^n < threshold
         # n > log(threshold) / log(1 - df)
         if program.discount_factor >= 1.0:
-            max_distance = 0  # Must be at best price
+            calculated_distance = 0  # Must be at best price
         elif program.discount_factor <= 0:
-            max_distance = 99  # No penalty, can be anywhere
+            calculated_distance = 99  # No penalty, can be anywhere
         else:
-            max_distance = int(
+            calculated_distance = int(
                 math.log(min_score_threshold) / math.log(1 - program.discount_factor)
             )
+
+        # Apply max tick cap for capital efficiency
+        max_distance = min(calculated_distance, max_tick_cap)
 
         return cls(
             min_size=min_size,
@@ -148,8 +157,9 @@ class LIPManager:
     - Track compliance metrics
     """
 
-    def __init__(self, connector):
+    def __init__(self, connector, max_tick_cap: int = 20):
         self.connector = connector
+        self.max_tick_cap = max_tick_cap
         self._programs: Dict[str, LIPProgram] = {}
         self._trackers: Dict[str, LIPTracker] = {}
         self._last_refresh: float = 0
@@ -202,7 +212,7 @@ class LIPManager:
         program = self.get_program(ticker)
         if program is None:
             return None
-        return LIPConstraints.from_program(program)
+        return LIPConstraints.from_program(program, max_tick_cap=self.max_tick_cap)
 
     def get_tracker(self, ticker: str) -> LIPTracker:
         """Get or create tracker for a ticker."""

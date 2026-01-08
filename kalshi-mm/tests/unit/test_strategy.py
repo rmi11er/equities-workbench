@@ -2,7 +2,8 @@
 
 import pytest
 from src.strategy import StoikovStrategy, StoikovParams
-from src.config import StrategyConfig
+from src.pegged import PeggedStrategy
+from src.config import StrategyConfig, PeggedModeConfig
 
 
 class TestStoikovStrategy:
@@ -12,11 +13,12 @@ class TestStoikovStrategy:
     def strategy(self):
         config = StrategyConfig(
             risk_aversion=0.05,
-            time_horizon=1.0,
             max_inventory=500,
             max_order_size=100,
             base_spread=2.0,
+            min_absolute_spread=2.0,
             quote_size=10,
+            time_normalization_sec=86400.0,
         )
         return StoikovStrategy(config)
 
@@ -28,7 +30,7 @@ class TestStoikovStrategy:
             volatility=5.0,
             gamma=0.05,
             time_horizon=1.0,
-            base_spread=2.0,
+            min_spread=2.0,
         )
 
         r = strategy.compute_reservation_price(params)
@@ -42,7 +44,7 @@ class TestStoikovStrategy:
             volatility=5.0,
             gamma=0.05,
             time_horizon=1.0,
-            base_spread=2.0,
+            min_spread=2.0,
         )
 
         r = strategy.compute_reservation_price(params)
@@ -62,7 +64,7 @@ class TestStoikovStrategy:
             volatility=5.0,
             gamma=0.05,
             time_horizon=1.0,
-            base_spread=2.0,
+            min_spread=2.0,
         )
 
         r = strategy.compute_reservation_price(params)
@@ -138,3 +140,79 @@ class TestStoikovStrategy:
             output = strategy.generate_quotes(mid, inv, vol)
             assert output.bid_price < output.ask_price, \
                 f"Crossed quotes at mid={mid}, inv={inv}, vol={vol}"
+
+
+class TestPeggedStrategy:
+    """Test Pegged strategy for solved markets."""
+
+    @pytest.fixture
+    def pegged_config(self):
+        return PeggedModeConfig(
+            enabled=True,
+            fair_value=50,
+            max_exposure=2000,
+            reload_threshold=0.8,
+        )
+
+    @pytest.fixture
+    def strategy_config(self):
+        return StrategyConfig(
+            max_order_size=100,
+            max_inventory=500,
+        )
+
+    @pytest.fixture
+    def pegged_strategy(self, pegged_config, strategy_config):
+        return PeggedStrategy(pegged_config, strategy_config)
+
+    def test_fixed_pricing_ignores_volatility(self, pegged_strategy, pegged_config):
+        """Test that pegged strategy uses fixed pricing regardless of market state."""
+        # Generate quotes with different inventory levels
+        quotes1 = pegged_strategy.generate_quotes(inventory=0)
+        quotes2 = pegged_strategy.generate_quotes(inventory=100)
+        quotes3 = pegged_strategy.generate_quotes(inventory=-100)
+
+        # Prices should always be FV-1 and FV+1
+        fv = pegged_config.fair_value
+        assert quotes1.bid_price == fv - 1
+        assert quotes1.ask_price == fv + 1
+        assert quotes2.bid_price == fv - 1
+        assert quotes2.ask_price == fv + 1
+        assert quotes3.bid_price == fv - 1
+        assert quotes3.ask_price == fv + 1
+
+    def test_reservation_price_is_fair_value(self, pegged_strategy, pegged_config):
+        """Test that reservation price equals fair value."""
+        quotes = pegged_strategy.generate_quotes(inventory=0)
+        assert quotes.reservation_price == float(pegged_config.fair_value)
+
+    def test_should_quote_at_max_exposure(self, pegged_strategy, pegged_config):
+        """Test quoting disabled at max exposure."""
+        max_exp = pegged_config.max_exposure
+
+        # At max long
+        should_bid, should_ask = pegged_strategy.should_quote(max_exp)
+        assert not should_bid  # Don't add to long
+        assert should_ask      # Can still sell
+
+        # At max short
+        should_bid, should_ask = pegged_strategy.should_quote(-max_exp)
+        assert should_bid      # Can still buy
+        assert not should_ask  # Don't add to short
+
+    def test_size_reduces_with_high_inventory(self, pegged_strategy):
+        """Test that sizes reduce when inventory is very high."""
+        quotes_neutral = pegged_strategy.generate_quotes(inventory=0)
+        quotes_long = pegged_strategy.generate_quotes(inventory=1500)  # 75% of max_exposure
+
+        # When very long, bid size should be reduced
+        assert quotes_long.bid_size < quotes_neutral.bid_size
+
+    def test_quotes_never_cross(self, pegged_strategy):
+        """Test that bid never equals or exceeds ask."""
+        test_cases = [0, 500, -500, 1000, -1000]
+
+        for inv in test_cases:
+            quotes = pegged_strategy.generate_quotes(inventory=inv)
+            assert quotes.bid_price < quotes.ask_price, \
+                f"Crossed quotes at inv={inv}"

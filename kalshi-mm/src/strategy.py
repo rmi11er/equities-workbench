@@ -2,6 +2,7 @@
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -11,6 +12,42 @@ from .types import StrategyOutput
 
 logger = logging.getLogger(__name__)
 
+# Market impact parameter for A-S spread formula
+MARKET_IMPACT_K = 1.5
+
+
+def calculate_time_horizon(expiry_ts: Optional[float], normalization_sec: float = 86400.0) -> float:
+    """
+    Calculate dynamic time horizon that shrinks as market nears expiration.
+
+    As expiry approaches, inventory risk increases (less time to scratch trades),
+    requiring more aggressive skewing.
+
+    Args:
+        expiry_ts: Unix timestamp of market expiration (None = infinite horizon)
+        normalization_sec: Seconds for T-t normalization (default 1 day)
+            - If expiry > normalization_sec away, T-t = 1.0
+            - If expiry < normalization_sec away, T-t decays linearly
+
+    Returns:
+        Time horizon clamped to [0.1, 1.0]
+        - 1.0 = far from expiry, normal risk
+        - 0.1 = near expiry, maximum urgency (but never zero)
+    """
+    if expiry_ts is None:
+        return 1.0
+
+    now = time.time()
+    seconds_remaining = expiry_ts - now
+
+    if seconds_remaining <= 0:
+        return 0.1  # Expired or about to expire - max urgency
+
+    fraction = seconds_remaining / normalization_sec
+
+    # Clamp: upper 1.0, lower 0.1 (never let T-t hit 0)
+    return max(0.1, min(1.0, fraction))
+
 
 @dataclass
 class StoikovParams:
@@ -19,8 +56,8 @@ class StoikovParams:
     inventory: int        # q - current position (positive = long YES)
     volatility: float     # σ - realized volatility (cents)
     gamma: float          # γ - risk aversion
-    time_horizon: float   # T-t - time remaining (constant = 1)
-    base_spread: float    # δ - base spread (cents)
+    time_horizon: float   # T-t - time remaining (dynamic, 0.1 to 1.0)
+    min_spread: float     # minimum absolute spread floor (cents)
 
 
 class StoikovStrategy:
@@ -69,20 +106,33 @@ class StoikovStrategy:
 
     def compute_spread(self, params: StoikovParams) -> float:
         """
-        Compute the optimal spread.
+        Compute the optimal spread using full Avellaneda-Stoikov formula.
 
-        In the full A-S model, optimal spread depends on volatility and gamma.
-        For simplicity, we use a base spread that can be configured.
-
-        A more sophisticated version could use:
         δ = γ * σ² * (T - t) + (2/γ) * ln(1 + γ/k)
 
-        where k is a fill rate parameter.
+        where:
+            γ = risk aversion
+            σ = volatility
+            T-t = time horizon
+            k = market impact parameter (MARKET_IMPACT_K = 1.5)
+
+        The result is then floored by min_absolute_spread to ensure we're
+        compensated in illiquid markets.
         """
-        # Base spread, potentially adjusted for volatility
-        # Higher volatility -> wider spread to compensate for adverse selection
-        vol_adjusted = params.base_spread * (1 + params.volatility / 10.0)
-        return max(params.base_spread, vol_adjusted)
+        gamma = params.gamma
+        sigma = params.volatility
+        T_minus_t = params.time_horizon
+
+        # Inventory risk component: wider spread when vol is high
+        inventory_risk_term = gamma * (sigma ** 2) * T_minus_t
+
+        # Market impact component: baseline spread from fill probability
+        market_impact_term = (2 / gamma) * math.log(1 + gamma / MARKET_IMPACT_K)
+
+        calculated_spread = inventory_risk_term + market_impact_term
+
+        # Apply minimum absolute spread floor (safety net for illiquid markets)
+        return max(calculated_spread, params.min_spread)
 
     def generate_quotes(
         self,
@@ -90,26 +140,36 @@ class StoikovStrategy:
         inventory: int,
         volatility: float,
         external_skew: float = 0.0,
+        expiry_ts: Optional[float] = None,
+        effective_spread: Optional[float] = None,
     ) -> StrategyOutput:
         """
         Generate bid and ask quotes.
 
         Args:
-            mid_price: Current mid price (cents)
+            mid_price: Current mid price (cents) - use effective mid for depth-based pricing
             inventory: Current position (positive = long YES)
             volatility: Realized volatility estimate (cents)
             external_skew: Additional skew from alpha engine (cents)
+            expiry_ts: Market expiration Unix timestamp (None = infinite horizon)
+            effective_spread: Spread based on depth-weighted prices (V2 depth-based pricing)
 
         Returns:
             StrategyOutput with bid/ask prices and sizes
         """
+        # Calculate dynamic time horizon based on expiry
+        time_horizon = calculate_time_horizon(
+            expiry_ts,
+            normalization_sec=self.config.time_normalization_sec,
+        )
+
         params = StoikovParams(
             mid_price=mid_price,
             inventory=inventory,
             volatility=volatility,
             gamma=self.config.risk_aversion,
-            time_horizon=self.config.time_horizon,
-            base_spread=self.config.base_spread,
+            time_horizon=time_horizon,
+            min_spread=self.config.min_absolute_spread,
         )
 
         # Compute reservation price

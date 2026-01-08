@@ -12,6 +12,8 @@ from .execution import ExecutionEngine
 from .logger import LogManager
 from .orderbook import OrderBookManager
 from .strategy import StoikovStrategy, AlphaEngine
+from .pegged import PeggedStrategy
+from .taker import ImpulseEngine, BailoutAction
 from .types import Position, StrategyOutput
 from .liquidity import analyze_liquidity, compute_adaptive_params
 from .lip import LIPManager, LIPConstraints
@@ -42,13 +44,23 @@ class MarketMaker:
         self.execution = ExecutionEngine(config.strategy, self.connector)
         self.alpha_engine = AlphaEngine()
         self.log_manager = LogManager(config.logging)
-        self.lip_manager = LIPManager(self.connector)
+        self.lip_manager = LIPManager(self.connector, max_tick_cap=config.lip.max_tick_cap)
+
+        # V2 components
+        self.pegged_strategy = PeggedStrategy(config.pegged_mode, config.strategy)
+        self.impulse_engine = ImpulseEngine(
+            config.impulse,
+            config.risk,
+            config.strategy,
+        )
 
         # State
         self._running = False
         self._position = Position(ticker=self.ticker)
         self._last_tick_time = 0.0
         self._tick_count = 0
+        self._market_expiry_ts: Optional[float] = None  # Unix timestamp of market expiry
+        self._last_reservation_price: float = 50.0  # Track reservation for impulse checks
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -63,6 +75,9 @@ class MarketMaker:
 
         # Start connector
         await self.connector.start()
+
+        # Fetch market expiry timestamp for dynamic time horizon
+        await self._fetch_market_expiry()
 
         # Connect WebSocket
         await self.connector.connect_ws()
@@ -133,6 +148,29 @@ class MarketMaker:
             logger.exception(f"Market maker error: {e}")
         finally:
             await self.stop()
+
+    async def _fetch_market_expiry(self) -> None:
+        """Fetch market details to get expiry timestamp for dynamic time horizon."""
+        try:
+            resp = await self.connector._request("GET", f"/markets/{self.ticker}")
+            market = resp.get("market", {})
+
+            # Parse expiration_time (ISO 8601 format)
+            expiry_str = market.get("expiration_time") or market.get("close_time")
+            if expiry_str:
+                from datetime import datetime
+                # Parse ISO format: "2024-12-31T23:59:59Z"
+                expiry_str = expiry_str.replace("Z", "+00:00")
+                expiry_dt = datetime.fromisoformat(expiry_str)
+                self._market_expiry_ts = expiry_dt.timestamp()
+                logger.info(f"Market {self.ticker} expires at {expiry_str} (T-t normalization active)")
+            else:
+                logger.warning(f"No expiry found for {self.ticker}, using infinite time horizon")
+                self._market_expiry_ts = None
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch market expiry: {e}, using infinite time horizon")
+            self._market_expiry_ts = None
 
     # -------------------------------------------------------------------------
     # Message Handling
@@ -263,13 +301,24 @@ class MarketMaker:
         if book is None:
             return
 
+        # 1. UPDATE METRICS
         # Analyze liquidity
         liq_metrics = analyze_liquidity(book)
         adaptive = compute_adaptive_params(liq_metrics)
 
-        # Get mid price - use 50 as default for empty books
-        mid = liq_metrics.mid_price
-        if mid is None:
+        # Get best bid/ask for impulse checks
+        best_bid = book.best_yes_bid()
+        best_ask = book.best_yes_ask()
+
+        # Get effective pricing (depth-based)
+        min_depth = self.config.strategy.effective_depth_contracts
+        eff_bid, eff_ask = book.get_effective_quote(min_depth)
+        effective_mid = (eff_bid + eff_ask) / 2.0
+        effective_spread = float(eff_ask - eff_bid)
+
+        # Get mid price - use effective mid, fall back to simple mid, then 50
+        mid = effective_mid
+        if liq_metrics.is_empty:
             mid = 50.0
 
         if liq_metrics.is_empty and self._tick_count % 100 == 0:
@@ -278,7 +327,8 @@ class MarketMaker:
             logger.info(
                 f"Liquidity score={liq_metrics.liquidity_score:.2f}, "
                 f"spread_mult={adaptive.spread_multiplier:.1f}, "
-                f"size_mult={adaptive.size_multiplier:.1f}"
+                f"size_mult={adaptive.size_multiplier:.1f}, "
+                f"eff_mid={effective_mid:.1f}, eff_spread={effective_spread:.0f}"
             )
 
         # Get volatility
@@ -290,69 +340,109 @@ class MarketMaker:
         # Get current inventory
         inventory = self._position.net_position
 
-        # Generate quotes
-        if liq_metrics.is_empty:
-            # Empty book: quote as wide as possible (1/99) with full size
-            # Max loss per contract is 1¢, potential gain is huge
-            quotes = StrategyOutput(
-                bid_price=1,
-                ask_price=99,
-                bid_size=self.config.strategy.max_order_size,
-                ask_size=self.config.strategy.max_order_size,
-                reservation_price=50.0,
-                spread=98.0,
-                inventory_skew=0.0,
-            )
-        else:
-            # Generate base quotes from strategy
-            quotes = self.strategy.generate_quotes(
-                mid_price=mid,
+        # Determine regime
+        regime = "PEGGED" if self.config.pegged_mode.enabled else "STANDARD"
+
+        # 2. CHECK IMPULSE (Priority 1)
+        if self.config.impulse.enabled:
+            bailout_action = self.impulse_engine.check_bailout(
                 inventory=inventory,
-                volatility=volatility,
-                external_skew=external_skew,
+                reservation_price=self._last_reservation_price,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                regime=regime,
             )
 
-            # Apply liquidity-adaptive adjustments
-            adjusted_spread = (quotes.ask_price - quotes.bid_price) * adaptive.spread_multiplier
-            half_spread = int(adjusted_spread / 2)
+            if bailout_action:
+                logger.warning(f"IMPULSE TRIGGERED: {bailout_action}")
+                await self._execute_bailout(bailout_action)
+                # Skip quoting this tick to process the dump
+                self._tick_count += 1
+                return
 
-            # Recalculate prices around reservation
-            new_bid = max(1, int(quotes.reservation_price - half_spread))
-            new_ask = min(99, int(quotes.reservation_price + half_spread))
+        # 3. SELECT STRATEGY (Priority 2)
+        if self.config.pegged_mode.enabled:
+            # Use Pegged Strategy (Fixed Price, Max Size)
+            quote_state = self.execution.get_quote_state(self.ticker)
+            current_bid_size = quote_state.bid_order.remaining if quote_state.bid_order else 0
+            current_ask_size = quote_state.ask_order.remaining if quote_state.ask_order else 0
 
-            # Ensure no cross
-            if new_bid >= new_ask:
-                new_bid = max(1, int(quotes.reservation_price) - 1)
-                new_ask = min(99, int(quotes.reservation_price) + 1)
-
-            # Adjust sizes
-            new_bid_size = max(1, int(quotes.bid_size * adaptive.size_multiplier))
-            new_ask_size = max(1, int(quotes.ask_size * adaptive.size_multiplier))
-
-            # Cap at max order size
-            max_size = self.config.strategy.max_order_size
-            new_bid_size = min(new_bid_size, max_size)
-            new_ask_size = min(new_ask_size, max_size)
-
-            quotes = StrategyOutput(
-                bid_price=new_bid,
-                ask_price=new_ask,
-                bid_size=new_bid_size,
-                ask_size=new_ask_size,
-                reservation_price=quotes.reservation_price,
-                spread=float(new_ask - new_bid),
-                inventory_skew=quotes.inventory_skew,
+            quotes = self.pegged_strategy.generate_quotes(
+                inventory=inventory,
+                current_bid_size=current_bid_size,
+                current_ask_size=current_ask_size,
             )
+            should_bid, should_ask = self.pegged_strategy.should_quote(inventory)
 
-        # Apply LIP constraints if active
+        else:
+            # Use Stoikov Strategy with Effective Depth Pricing
+            if liq_metrics.is_empty:
+                # Empty book: quote as wide as possible (1/99) with full size
+                # Max loss per contract is 1¢, potential gain is huge
+                quotes = StrategyOutput(
+                    bid_price=1,
+                    ask_price=99,
+                    bid_size=self.config.strategy.max_order_size,
+                    ask_size=self.config.strategy.max_order_size,
+                    reservation_price=50.0,
+                    spread=98.0,
+                    inventory_skew=0.0,
+                )
+            else:
+                # Generate base quotes using effective mid price
+                quotes = self.strategy.generate_quotes(
+                    mid_price=effective_mid,  # Use effective mid for depth-based pricing
+                    inventory=inventory,
+                    volatility=volatility,
+                    external_skew=external_skew,
+                    expiry_ts=self._market_expiry_ts,
+                    effective_spread=effective_spread,
+                )
+
+                # Apply liquidity-adaptive adjustments
+                adjusted_spread = (quotes.ask_price - quotes.bid_price) * adaptive.spread_multiplier
+                half_spread = int(adjusted_spread / 2)
+
+                # Recalculate prices around reservation
+                new_bid = max(1, int(quotes.reservation_price - half_spread))
+                new_ask = min(99, int(quotes.reservation_price + half_spread))
+
+                # Ensure no cross
+                if new_bid >= new_ask:
+                    new_bid = max(1, int(quotes.reservation_price) - 1)
+                    new_ask = min(99, int(quotes.reservation_price) + 1)
+
+                # Adjust sizes
+                new_bid_size = max(1, int(quotes.bid_size * adaptive.size_multiplier))
+                new_ask_size = max(1, int(quotes.ask_size * adaptive.size_multiplier))
+
+                # Cap at max order size
+                max_size = self.config.strategy.max_order_size
+                new_bid_size = min(new_bid_size, max_size)
+                new_ask_size = min(new_ask_size, max_size)
+
+                quotes = StrategyOutput(
+                    bid_price=new_bid,
+                    ask_price=new_ask,
+                    bid_size=new_bid_size,
+                    ask_size=new_ask_size,
+                    reservation_price=quotes.reservation_price,
+                    spread=float(new_ask - new_bid),
+                    inventory_skew=quotes.inventory_skew,
+                )
+
+            # Check if we should quote each side (Stoikov limits)
+            should_bid, should_ask = self.strategy.should_quote(inventory)
+
+        # Store reservation price for next impulse check
+        self._last_reservation_price = quotes.reservation_price
+
+        # Apply LIP constraints if active (both modes)
         lip_constraints = self.lip_manager.get_constraints(self.ticker)
         if lip_constraints and lip_constraints.is_active:
             quotes = self._apply_lip_constraints(quotes, lip_constraints, book)
 
-        # Check if we should quote each side
-        should_bid, should_ask = self.strategy.should_quote(inventory)
-
-        # Update execution
+        # 4. EXECUTE
         await self.execution.update_quotes(
             ticker=self.ticker,
             target=quotes,
@@ -389,14 +479,15 @@ class MarketMaker:
                 our_ask_size=quotes.ask_size if should_ask else 0,
                 our_bid_price=quotes.bid_price if should_bid else None,
                 our_ask_price=quotes.ask_price if should_ask else None,
-                best_bid=book.best_yes_bid(),
-                best_ask=book.best_yes_ask(),
+                best_bid=best_bid,
+                best_ask=best_ask,
             )
 
         # Periodic logging
         if self._tick_count % 100 == 0:
+            mode_str = "PEGGED" if self.config.pegged_mode.enabled else "STOIKOV"
             logger.info(
-                f"Tick {self._tick_count}: mid={mid:.1f}, "
+                f"Tick {self._tick_count} [{mode_str}]: mid={mid:.1f}, "
                 f"bid={quotes.bid_price}, ask={quotes.ask_price}, "
                 f"inv={inventory}, vol={volatility:.2f}, "
                 f"latency={latency_ms:.1f}ms"
@@ -410,6 +501,27 @@ class MarketMaker:
                     f"qualifying={lip_status['snapshots_qualifying']}/{lip_status['snapshots_total']}, "
                     f"est_score={lip_status['estimated_score']:.0f}"
                 )
+
+    async def _execute_bailout(self, action: BailoutAction) -> None:
+        """
+        Execute a bailout action via IOC simulation.
+
+        Args:
+            action: The bailout action to execute
+        """
+        logger.warning(f"Executing bailout: {action}")
+
+        result = await self.execution.send_ioc_simulation(
+            ticker=self.ticker,
+            side=action.side,
+            price=action.aggressive_price,
+            count=action.quantity,
+        )
+
+        if result.get("success"):
+            logger.info(f"Bailout IOC sent: order_id={result.get('order_id')}")
+        else:
+            logger.error(f"Bailout IOC failed: {result.get('error')}")
 
     # -------------------------------------------------------------------------
     # Monitoring

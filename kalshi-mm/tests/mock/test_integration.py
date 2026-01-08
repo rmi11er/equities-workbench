@@ -6,8 +6,13 @@ import asyncio
 from .mock_exchange import MockKalshiExchange, MockConnector
 from src.orderbook import OrderBookManager
 from src.strategy import StoikovStrategy
+from src.pegged import PeggedStrategy
+from src.taker import ImpulseEngine, BailoutReason
 from src.execution import ExecutionEngine
-from src.config import Config, StrategyConfig, VolatilityConfig
+from src.config import (
+    Config, StrategyConfig, VolatilityConfig,
+    PeggedModeConfig, ImpulseConfig, RiskConfig
+)
 
 
 class TestIntegration:
@@ -34,11 +39,12 @@ class TestIntegration:
     def strategy(self):
         config = StrategyConfig(
             risk_aversion=0.05,
-            time_horizon=1.0,
             max_inventory=500,
             max_order_size=100,
             base_spread=2.0,
+            min_absolute_spread=2.0,
             quote_size=10,
+            time_normalization_sec=86400.0,
             debounce_cents=2,
             debounce_seconds=5.0,
         )
@@ -253,3 +259,182 @@ class TestIntegration:
         # Short inventory should raise quotes (want to buy)
         assert quotes_short.bid_price >= quotes_neutral.bid_price
         assert quotes_short.ask_price >= quotes_neutral.ask_price
+
+
+class TestV2Integration:
+    """V2 integration tests for Impulse Control, Pegged Mode, and Depth-Based Pricing."""
+
+    @pytest.fixture
+    def exchange(self):
+        return MockKalshiExchange()
+
+    @pytest.fixture
+    def connector(self, exchange):
+        return MockConnector(exchange)
+
+    @pytest.fixture
+    def orderbook_manager(self):
+        config = VolatilityConfig(
+            ema_halflife_sec=60.0,
+            min_volatility=0.1,
+            initial_volatility=5.0,
+        )
+        return OrderBookManager(config)
+
+    @pytest.fixture
+    def impulse_engine(self):
+        impulse_cfg = ImpulseConfig(
+            enabled=True,
+            taker_fee_cents=7,
+            slippage_buffer=5,
+            ofi_window_sec=10.0,
+            ofi_threshold=500,
+        )
+        risk_cfg = RiskConfig(
+            hard_stop_ratio=1.2,
+            bailout_threshold=1,
+        )
+        strategy_cfg = StrategyConfig(
+            max_inventory=500,
+            max_order_size=100,
+        )
+        return ImpulseEngine(impulse_cfg, risk_cfg, strategy_cfg)
+
+    @pytest.fixture
+    def pegged_strategy(self):
+        pegged_cfg = PeggedModeConfig(
+            enabled=True,
+            fair_value=50,
+            max_exposure=2000,
+            reload_threshold=0.8,
+        )
+        strategy_cfg = StrategyConfig(
+            max_order_size=100,
+            max_inventory=500,
+        )
+        return PeggedStrategy(pegged_cfg, strategy_cfg)
+
+    @pytest.mark.asyncio
+    async def test_effective_depth_pricing(self, exchange, connector, orderbook_manager):
+        """Test that effective depth pricing ignores dust in thin books."""
+        connector.on_message(orderbook_manager.handle_message)
+
+        # Set up a thin book with dust at top
+        exchange.set_orderbook("TEST-TICKER", {
+            "yes": [[30, 5], [35, 10], [40, 100], [45, 200]],  # Dust at 30, 35
+            "no": [[55, 5], [60, 10], [65, 100], [70, 200]],   # Dust at 55, 60
+        })
+
+        book = orderbook_manager.get("TEST-TICKER")
+        assert book is not None
+
+        # Get effective quote with min_depth=100
+        eff_bid, eff_ask = book.get_effective_quote(min_depth=100)
+
+        # Should skip the dust and use the real liquidity levels
+        # YES bids derived from NO asks: 65 -> YES bid at 35, 70 -> YES bid at 30
+        # But our dust is at those levels too
+        # Effective ask should be at 40 (100 contracts of YES asks)
+        assert eff_ask == 40
+
+    @pytest.mark.asyncio
+    async def test_impulse_hard_limit_fires(self, impulse_engine):
+        """Test that impulse engine fires on hard limit breach."""
+        # max_inventory=500, hard_stop_ratio=1.2, so hard_stop=600
+        action = impulse_engine.check_bailout(
+            inventory=700,  # Way over limit
+            reservation_price=50.0,
+            best_bid=48,
+            best_ask=52,
+            regime="STANDARD",
+        )
+
+        assert action is not None
+        assert action.reason == BailoutReason.HARD_LIMIT
+        assert action.quantity == 200  # 700 - 500 = 200 excess
+
+    @pytest.mark.asyncio
+    async def test_impulse_ignores_ofi_in_pegged_mode(self, impulse_engine):
+        """Test that impulse engine ignores OFI when in PEGGED mode."""
+        # Simulate heavy selling pressure
+        for _ in range(10):
+            impulse_engine.record_trade(size=100, is_buy=False)  # -1000 OFI
+
+        # In STANDARD mode, this would trigger
+        action_standard = impulse_engine.check_bailout(
+            inventory=200,
+            reservation_price=50.0,
+            best_bid=48,
+            best_ask=52,
+            regime="STANDARD",
+        )
+        assert action_standard is not None
+        assert action_standard.reason == BailoutReason.TOXICITY_SPIKE
+
+        # Reset and test PEGGED mode
+        impulse_engine.reset()
+        for _ in range(10):
+            impulse_engine.record_trade(size=100, is_buy=False)
+
+        action_pegged = impulse_engine.check_bailout(
+            inventory=200,
+            reservation_price=50.0,
+            best_bid=48,
+            best_ask=52,
+            regime="PEGGED",
+        )
+
+        # Should NOT trigger in PEGGED mode
+        assert action_pegged is None
+
+    @pytest.mark.asyncio
+    async def test_pegged_strategy_fixed_pricing(self, pegged_strategy):
+        """Test that pegged strategy uses fixed pricing."""
+        quotes = pegged_strategy.generate_quotes(inventory=0)
+
+        # Should be FV-1 and FV+1
+        assert quotes.bid_price == 49
+        assert quotes.ask_price == 51
+        assert quotes.reservation_price == 50.0
+
+    @pytest.mark.asyncio
+    async def test_pegged_strategy_inventory_affects_size_not_price(self, pegged_strategy):
+        """Test that pegged strategy adjusts size but not price with inventory."""
+        quotes_neutral = pegged_strategy.generate_quotes(inventory=0)
+        quotes_long = pegged_strategy.generate_quotes(inventory=1500)  # 75% of max_exposure
+
+        # Prices should stay fixed
+        assert quotes_long.bid_price == quotes_neutral.bid_price
+        assert quotes_long.ask_price == quotes_neutral.ask_price
+
+        # But bid size should be reduced when long
+        assert quotes_long.bid_size < quotes_neutral.bid_size
+
+    @pytest.mark.asyncio
+    async def test_ioc_simulation_for_bailout(self, exchange, connector):
+        """Test IOC simulation execution for bailout."""
+        from src.execution import ExecutionEngine
+
+        config = StrategyConfig()
+        engine = ExecutionEngine(config, connector)
+
+        # Send IOC simulation
+        result = await engine.send_ioc_simulation(
+            ticker="TEST-TICKER",
+            side="yes",
+            price=48,
+            count=50,
+        )
+
+        assert result.get("success") is True
+        assert "order_id" in result
+
+        # Order should be cancelled (simulating IOC behavior)
+        orders = await connector.get_orders("TEST-TICKER")
+        order = next(
+            (o for o in orders["orders"] if o["order_id"] == result["order_id"]),
+            None
+        )
+        # Should be cancelled or not exist
+        if order:
+            assert order["status"] == "cancelled"

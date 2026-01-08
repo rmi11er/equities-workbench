@@ -345,6 +345,80 @@ class ExecutionEngine:
         logger.warning(f"Pulling quotes for {ticker}")
         await self.cancel_all(ticker)
 
+    async def send_ioc_simulation(
+        self,
+        ticker: str,
+        side: str,
+        price: int,
+        count: int,
+    ) -> dict:
+        """
+        Simulate an IOC (Immediate-or-Cancel) order.
+
+        Kalshi REST API doesn't support true IOC. We simulate by:
+        1. Send aggressive limit order (crossing the spread)
+        2. Immediately send cancel request
+
+        The matching engine executes what it can before the cancel arrives.
+
+        Args:
+            ticker: Market ticker
+            side: "yes" or "no"
+            price: Aggressive limit price (should cross spread)
+            count: Number of contracts to try to fill
+
+        Returns:
+            Dict with order_id and status
+        """
+        order_id = None
+        try:
+            # Step 1: Create aggressive limit order
+            resp = await self.connector.create_order(
+                ticker=ticker,
+                side=side,
+                price=price,
+                count=count,
+            )
+            order_id = resp.get("order", resp).get("order_id")
+
+            if not order_id:
+                logger.error("IOC simulation: No order_id in response")
+                return {"success": False, "error": "No order_id"}
+
+            logger.info(f"IOC simulation: Created order {order_id} {side} {count}@{price}")
+
+            # Step 2: Immediately cancel to prevent resting
+            # Small sleep to let matching engine process (optional, can remove)
+            # await asyncio.sleep(0.01)  # 10ms
+
+            try:
+                await self.connector.cancel_order(order_id)
+                logger.info(f"IOC simulation: Cancelled remainder of {order_id}")
+            except APIError as cancel_err:
+                # Cancel might fail if order was fully filled - that's OK
+                if cancel_err.status == 404:
+                    logger.info(f"IOC simulation: Order {order_id} already gone (likely filled)")
+                else:
+                    logger.warning(f"IOC simulation: Cancel failed: {cancel_err}")
+
+            return {
+                "success": True,
+                "order_id": order_id,
+                "side": side,
+                "price": price,
+                "count": count,
+            }
+
+        except APIError as e:
+            logger.error(f"IOC simulation failed: {e}")
+            # Try to cancel if we got an order_id
+            if order_id:
+                try:
+                    await self.connector.cancel_order(order_id)
+                except APIError:
+                    pass
+            return {"success": False, "error": str(e)}
+
     # -------------------------------------------------------------------------
     # Fill Handling & P&L
     # -------------------------------------------------------------------------

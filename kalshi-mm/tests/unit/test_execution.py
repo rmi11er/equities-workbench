@@ -17,11 +17,12 @@ class TestOrderDiff:
     def config(self):
         return StrategyConfig(
             risk_aversion=0.05,
-            time_horizon=1.0,
             max_inventory=500,
             max_order_size=100,
             base_spread=2.0,
+            min_absolute_spread=2.0,
             quote_size=10,
+            time_normalization_sec=86400.0,
             debounce_cents=2,
             debounce_seconds=5.0,
         )

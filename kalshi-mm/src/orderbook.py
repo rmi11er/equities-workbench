@@ -192,6 +192,80 @@ class OrderBook:
 
         return (bid_volume - ask_volume) / total
 
+    def get_effective_quote(self, min_depth: int) -> tuple[int, int]:
+        """
+        Get effective bid/ask prices that represent "real" liquidity.
+
+        Prevents the bot from reacting to "dust" (1-2 contracts) in thin markets.
+        Walks through the order book until cumulative volume >= min_depth.
+
+        Args:
+            min_depth: Minimum contracts required to define "real" price
+
+        Returns:
+            (effective_bid, effective_ask) tuple. If entire book < min_depth,
+            returns worst available prices or (1, 99) as fallback.
+        """
+        # Walk bids (descending price) until we hit min_depth
+        effective_bid = 1  # Fallback
+        cumulative_bid = 0
+        for price in sorted(self.yes_bids.keys(), reverse=True):
+            cumulative_bid += self.yes_bids[price]
+            effective_bid = price
+            if cumulative_bid >= min_depth:
+                break
+
+        # If we didn't find enough depth, use worst bid or fallback
+        if cumulative_bid < min_depth:
+            if self.yes_bids:
+                effective_bid = min(self.yes_bids.keys())
+            else:
+                effective_bid = 1
+
+        # Walk asks (ascending price) until we hit min_depth
+        effective_ask = 99  # Fallback
+        cumulative_ask = 0
+        for price in sorted(self.yes_asks.keys()):
+            cumulative_ask += self.yes_asks[price]
+            effective_ask = price
+            if cumulative_ask >= min_depth:
+                break
+
+        # If we didn't find enough depth, use worst ask or fallback
+        if cumulative_ask < min_depth:
+            if self.yes_asks:
+                effective_ask = max(self.yes_asks.keys())
+            else:
+                effective_ask = 99
+
+        return effective_bid, effective_ask
+
+    def get_effective_spread(self, min_depth: int) -> float:
+        """
+        Calculate effective spread based on depth-weighted prices.
+
+        Args:
+            min_depth: Minimum contracts to consider for effective price
+
+        Returns:
+            Effective spread in cents
+        """
+        eff_bid, eff_ask = self.get_effective_quote(min_depth)
+        return float(eff_ask - eff_bid)
+
+    def get_effective_mid(self, min_depth: int) -> float:
+        """
+        Calculate effective mid price based on depth-weighted prices.
+
+        Args:
+            min_depth: Minimum contracts to consider for effective price
+
+        Returns:
+            Effective mid price
+        """
+        eff_bid, eff_ask = self.get_effective_quote(min_depth)
+        return (eff_bid + eff_ask) / 2.0
+
 
 class VolatilityEstimator:
     """
