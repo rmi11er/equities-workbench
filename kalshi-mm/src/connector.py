@@ -18,6 +18,7 @@ from .constants import (
     Environment,
     WS_URLS,
     REST_URLS,
+    REST_PATH,
     WS_PATH,
     MAX_RECONNECT_ATTEMPTS,
     INITIAL_BACKOFF_SEC,
@@ -145,7 +146,9 @@ class KalshiConnector:
             await self._rate_limiter.acquire_read()
 
         url = f"{self.rest_url}{path}"
-        headers = self._auth.get_auth_headers(method, path)
+        # Sign with full path including /trade-api/v2 prefix
+        sign_path = f"{REST_PATH}{path}"
+        headers = self._auth.get_auth_headers(method, sign_path)
         headers["Content-Type"] = "application/json"
 
         kwargs: dict[str, Any] = {"headers": headers}
@@ -157,7 +160,13 @@ class KalshiConnector:
                 logger.warning("Rate limit hit (429)")
                 raise RateLimitError("Rate limit exceeded")
 
-            resp_data = await resp.json()
+            # Handle non-JSON responses
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                resp_data = await resp.json()
+            else:
+                text = await resp.text()
+                resp_data = {"error": text, "status": resp.status}
 
             if resp.status >= 400:
                 logger.error(f"API error {resp.status}: {resp_data}")

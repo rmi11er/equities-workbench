@@ -321,7 +321,18 @@ class ExecutionEngine:
         try:
             await self.connector.cancel_all_orders(ticker)
         except APIError as e:
-            logger.error(f"Cancel all failed: {e}")
+            # Batch cancel might not exist - try canceling individually
+            logger.warning(f"Batch cancel failed ({e.status}), trying individual cancels")
+            try:
+                orders = await self.connector.get_orders(ticker)
+                for order in orders.get("orders", []):
+                    if order.get("status") == "resting":
+                        try:
+                            await self.connector.cancel_order(order["order_id"])
+                        except APIError:
+                            pass
+            except APIError as e2:
+                logger.error(f"Cancel all failed: {e2}")
 
         # Clear our state
         if ticker:

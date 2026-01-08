@@ -45,9 +45,12 @@ DEFAULT_READ_RATE = 20  # req/sec
 DEFAULT_WRITE_RATE = 10  # req/sec
 CANCEL_COST = 0.2  # cancels count as 0.2 transactions
 
+# API Paths (for signing)
+REST_PATH = "/trade-api/v2"
+WS_PATH = "/trade-api/ws/v2"
+
 # WebSocket
 WS_HEARTBEAT_INTERVAL = 10  # seconds
-WS_PATH = "/trade-api/ws/v2"
 
 # Reconnection
 MAX_RECONNECT_ATTEMPTS = 10

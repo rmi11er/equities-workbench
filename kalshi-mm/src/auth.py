@@ -43,21 +43,24 @@ class KalshiAuth:
         Args:
             timestamp_ms: Unix timestamp in milliseconds
             method: HTTP method (GET, POST, DELETE)
-            path: API path (e.g., /trade-api/ws/v2)
+            path: API path (e.g., /trade-api/v2/portfolio/balance)
 
         Returns:
             Base64-encoded signature
         """
         private_key = self._load_private_key()
 
-        message = f"{timestamp_ms}{method}{path}"
+        # Strip query parameters from path before signing
+        path_without_query = path.split("?")[0]
+
+        message = f"{timestamp_ms}{method}{path_without_query}"
         message_bytes = message.encode("utf-8")
 
         signature = private_key.sign(
             message_bytes,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH,
+                salt_length=padding.PSS.DIGEST_LENGTH,  # Kalshi requires DIGEST_LENGTH, not MAX_LENGTH
             ),
             hashes.SHA256(),
         )
