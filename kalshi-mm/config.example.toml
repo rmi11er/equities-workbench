@@ -1,0 +1,40 @@
+# Kalshi Market Maker Configuration
+# Copy this to config.toml and fill in your values
+
+environment = "demo"  # "demo" or "production"
+market_ticker = "TODO"  # e.g., "KXBTC-24DEC-100K"
+
+[credentials]
+api_key_id = "TODO"  # Your Kalshi API key ID
+private_key_path = "TODO"  # Path to your RSA private key file (PEM format)
+
+[strategy]
+# Avellaneda-Stoikov parameters
+risk_aversion = 0.05       # gamma - higher = more conservative
+time_horizon = 1.0         # T-t constant (not calendar-based)
+
+# Position limits
+max_inventory = 500        # max contracts to hold
+max_order_size = 100       # fat finger protection
+
+# Quote generation
+base_spread = 2.0          # base spread in cents
+quote_size = 10            # contracts per quote
+
+# Debouncing - only update quotes when:
+debounce_cents = 2         # price change exceeds this, OR
+debounce_seconds = 5.0     # this much time has elapsed
+
+[volatility]
+ema_halflife_sec = 60.0    # half-life for volatility EMA (seconds)
+min_volatility = 0.1       # volatility floor
+initial_volatility = 5.0   # starting estimate (cents)
+
+[rate_limit]
+read_rate = 20             # read requests per second (Basic tier)
+write_rate = 10            # write requests per second (Basic tier)
+
+[logging]
+ops_log_path = "logs/ops.log"
+tape_csv_path = "logs/tape.csv"
+log_level = "INFO"         # DEBUG, INFO, WARNING, ERROR
