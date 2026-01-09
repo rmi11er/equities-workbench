@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.config import load_config, Config
 from src.constants import Environment
 from src.market_maker import MarketMaker
+from src.run_context import create_run_context
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,8 +92,19 @@ async def main() -> int:
         print("Set api_key_id and private_key_path in config.toml")
         return 1
 
-    # Create market maker
-    mm = MarketMaker(config)
+    # Create run context for versioned logging
+    run_context = create_run_context(
+        base_log_dir=config.logging.base_log_dir,
+        ticker=config.market_ticker,
+        environment=config.environment.name,
+        config=config,
+    )
+
+    # Print startup banner with version info
+    print(run_context.get_startup_banner())
+
+    # Create market maker with run context
+    mm = MarketMaker(config, run_context=run_context)
 
     # Setup signal handlers
     loop = asyncio.get_event_loop()

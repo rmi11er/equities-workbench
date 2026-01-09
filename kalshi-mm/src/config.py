@@ -84,8 +84,9 @@ class RateLimitConfig:
 @dataclass
 class LoggingConfig:
     """Logging configuration."""
-    ops_log_path: str = "logs/ops.log"
-    tape_csv_path: str = "logs/tape.csv"
+    base_log_dir: str = "logs"  # Base directory for all logs
+    ops_log_path: str = "logs/ops.log"  # Overridden by RunContext if used
+    tape_csv_path: str = "logs/tape.csv"  # Overridden by RunContext if used
     log_level: str = "INFO"
 
 
@@ -213,6 +214,7 @@ class Config:
 
         log_data = data.get("logging", {})
         logging_cfg = LoggingConfig(
+            base_log_dir=log_data.get("base_log_dir", "logs"),
             ops_log_path=log_data.get("ops_log_path", "logs/ops.log"),
             tape_csv_path=log_data.get("tape_csv_path", "logs/tape.csv"),
             log_level=log_data.get("log_level", "INFO"),

@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from datetime import datetime
 
@@ -25,6 +25,9 @@ from .decision_log import (
     MarketState, PositionState, LatencyBreakdown,
 )
 
+if TYPE_CHECKING:
+    from .run_context import RunContext
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,14 +43,19 @@ class MarketMaker:
     - Logger: Observability
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, run_context: Optional["RunContext"] = None):
         self.config = config
         self.ticker = config.market_ticker
+        self.run_context = run_context
+
+        # Determine decision log path from RunContext or config
+        if run_context and run_context.decisions_path:
+            decisions_path = run_context.decisions_path
+        else:
+            decisions_path = config.logging.ops_log_path.replace("ops.log", "decisions.jsonl")
 
         # Decision logging (initialize first so it can be passed to other components)
-        self.decision_logger = DecisionLogger(
-            log_path=config.logging.ops_log_path.replace("ops.log", "decisions.jsonl")
-        )
+        self.decision_logger = DecisionLogger(log_path=decisions_path)
 
         # Core components
         self.connector = KalshiConnector(config)
@@ -59,7 +67,7 @@ class MarketMaker:
             decision_logger=self.decision_logger,
         )
         self.alpha_engine = AlphaEngine()
-        self.log_manager = LogManager(config.logging)
+        self.log_manager = LogManager(config.logging, run_context=run_context)
         self.lip_manager = LIPManager(self.connector, max_tick_cap=config.lip.max_tick_cap)
 
         # V2 components

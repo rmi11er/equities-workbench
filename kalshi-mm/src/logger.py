@@ -152,14 +152,27 @@ class LogManager:
     Provides:
     - Structured ops logging (ops.log)
     - Data tape recording (tape.csv)
+
+    When initialized with a RunContext, uses run-specific paths.
+    Otherwise falls back to config paths.
     """
 
-    def __init__(self, config: LoggingConfig):
+    def __init__(self, config: LoggingConfig, run_context: Optional["RunContext"] = None):
+        from .run_context import RunContext  # Import here to avoid circular
         self.config = config
+        self.run_context = run_context
+
+        # Determine paths: RunContext overrides config
+        if run_context and run_context.ops_log_path:
+            ops_log_path = run_context.ops_log_path
+            tape_csv_path = run_context.tape_path
+        else:
+            ops_log_path = config.ops_log_path
+            tape_csv_path = config.tape_csv_path
 
         # Setup ops logging
         self._ops_handler = AsyncFileHandler(
-            config.ops_log_path,
+            ops_log_path,
             level=getattr(logging, config.log_level),
         )
         self._ops_handler.setFormatter(
@@ -170,7 +183,7 @@ class LogManager:
         )
 
         # Setup tape writer
-        self._tape_writer = TapeWriter(config.tape_csv_path)
+        self._tape_writer = TapeWriter(tape_csv_path)
 
         # Console handler for development
         self._console_handler = logging.StreamHandler()
@@ -193,6 +206,13 @@ class LogManager:
         root.addHandler(self._console_handler)
 
         logging.info("Logging started")
+
+        # Log run context if available
+        if self.run_context:
+            logging.info(f"Run ID: {self.run_context.run_id}")
+            logging.info(f"Git: {self.run_context.git_info.commit_short} ({self.run_context.git_info.branch})")
+            if self.run_context.git_info.dirty:
+                logging.warning("Git working directory is dirty (uncommitted changes)")
 
     def stop(self) -> None:
         """Stop all logging infrastructure."""
