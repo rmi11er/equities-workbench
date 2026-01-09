@@ -171,6 +171,36 @@ class OrderBook:
             return float(ask - bid)
         return None
 
+    def is_valid(self) -> bool:
+        """
+        Check if the orderbook is in a valid, tradeable state.
+
+        Returns False if:
+        - Book is empty (no bids or asks)
+        - Book is crossed (bid >= ask)
+        - Prices are out of bounds
+
+        This MUST be checked before quoting to prevent trading on garbage data.
+        """
+        bid = self.best_yes_bid()
+        ask = self.best_yes_ask()
+
+        # Empty book
+        if bid is None or ask is None:
+            return False
+
+        # Crossed book (bid >= ask means impossible market)
+        if bid >= ask:
+            logger.warning(f"CROSSED BOOK DETECTED: bid={bid} >= ask={ask}")
+            return False
+
+        # Sanity check: prices should be 1-99
+        if bid < 1 or bid > 99 or ask < 1 or ask > 99:
+            logger.warning(f"INVALID PRICES: bid={bid}, ask={ask}")
+            return False
+
+        return True
+
     def get_ofi(self, levels: int = 3) -> float:
         """
         Calculate Order Flow Imbalance.

@@ -231,6 +231,7 @@ class KalshiConnector:
     async def amend_order(
         self,
         order_id: str,
+        side: str,
         price: Optional[int] = None,
         count: Optional[int] = None,
     ) -> dict:
@@ -239,6 +240,7 @@ class KalshiConnector:
 
         Args:
             order_id: The order to amend
+            side: "yes" or "no" - required for price field naming
             price: New price (optional)
             count: New max fillable count (optional)
 
@@ -247,7 +249,11 @@ class KalshiConnector:
         """
         data = {}
         if price is not None:
-            data["price"] = price
+            # Kalshi requires yes_price or no_price, NOT just "price"
+            if side == "yes":
+                data["yes_price"] = price
+            else:
+                data["no_price"] = price
         if count is not None:
             data["count"] = count
 

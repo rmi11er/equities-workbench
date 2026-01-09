@@ -63,10 +63,12 @@ class ExecutionEngine:
         config: StrategyConfig,
         connector: KalshiConnector,
         decision_logger: Optional["DecisionLogger"] = None,
+        max_consecutive_errors: int = 5,
     ):
         self.config = config
         self.connector = connector
         self.decision_logger = decision_logger
+        self.max_consecutive_errors = max_consecutive_errors
 
         # State per ticker
         self._quotes: dict[str, QuoteState] = {}
@@ -75,6 +77,27 @@ class ExecutionEngine:
         self._realized_pnl: float = 0.0
         self._avg_entry_price: Optional[float] = None
         self._last_mid: dict[str, float] = {}  # Track mid for fill context
+
+        # API error tracking for circuit breaker
+        self._consecutive_api_errors: int = 0
+        self._total_api_errors: int = 0
+
+    def record_api_success(self) -> None:
+        """Record successful API call - resets consecutive error counter."""
+        self._consecutive_api_errors = 0
+
+    def record_api_error(self) -> None:
+        """Record API error - increments counters."""
+        self._consecutive_api_errors += 1
+        self._total_api_errors += 1
+        logger.warning(
+            f"API error #{self._consecutive_api_errors} "
+            f"(total: {self._total_api_errors}, max: {self.max_consecutive_errors})"
+        )
+
+    def should_halt_on_errors(self) -> bool:
+        """Check if we've hit too many consecutive API errors."""
+        return self._consecutive_api_errors >= self.max_consecutive_errors
 
     def get_quote_state(self, ticker: str) -> QuoteState:
         """Get or create quote state for a ticker."""
@@ -220,15 +243,21 @@ class ExecutionEngine:
                     await self.connector.cancel_order(diff.order_id)
                     setattr(state, attr, None)
                     logger.info(f"Cancelled order {diff.order_id}")
+                    self.record_api_success()
                 except APIError as e:
                     logger.error(f"Cancel failed: {e}")
+                    self.record_api_error()
 
         # Execute amends
-        for diff, attr in [(bid_diff, "bid_order"), (ask_diff, "ask_order")]:
+        for diff, attr, side_str in [
+            (bid_diff, "bid_order", "yes"),   # Bids are YES orders
+            (ask_diff, "ask_order", "no"),    # Asks are NO orders
+        ]:
             if diff.action == OrderAction.AMEND and diff.order_id:
                 try:
                     resp = await self.connector.amend_order(
                         order_id=diff.order_id,
+                        side=side_str,
                         price=diff.price,
                         count=diff.size,
                     )
@@ -240,8 +269,10 @@ class ExecutionEngine:
                         if diff.size is not None:
                             order.remaining = diff.size
                     logger.info(f"Amended order {diff.order_id}: price={diff.price}, size={diff.size}")
+                    self.record_api_success()
                 except APIError as e:
                     logger.error(f"Amend failed: {e}")
+                    self.record_api_error()
                     # On failure, cancel and recreate
                     try:
                         await self.connector.cancel_order(diff.order_id)
@@ -277,9 +308,11 @@ class ExecutionEngine:
                     )
                     setattr(state, attr, order)
                     logger.info(f"Created order {order.order_id}: {diff.side.value} {diff.size}@{diff.price}")
+                    self.record_api_success()
 
                 except APIError as e:
                     logger.error(f"Create order failed: {e}")
+                    self.record_api_error()
 
     async def update_quotes(
         self,

@@ -174,6 +174,7 @@ class MockKalshiExchange:
     async def amend_order(
         self,
         order_id: str,
+        side: str = "yes",
         price: Optional[int] = None,
         count: Optional[int] = None,
     ) -> dict:
@@ -364,8 +365,8 @@ class MockConnector:
     async def create_order(self, ticker: str, side: str, price: int, count: int, **kwargs) -> dict:
         return await self._exchange.create_order(ticker, side, price, count)
 
-    async def amend_order(self, order_id: str, price: Optional[int] = None, count: Optional[int] = None) -> dict:
-        return await self._exchange.amend_order(order_id, price, count)
+    async def amend_order(self, order_id: str, side: str = "yes", price: Optional[int] = None, count: Optional[int] = None) -> dict:
+        return await self._exchange.amend_order(order_id, side, price, count)
 
     async def cancel_order(self, order_id: str) -> dict:
         return await self._exchange.cancel_order(order_id)

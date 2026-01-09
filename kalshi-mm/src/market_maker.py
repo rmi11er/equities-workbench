@@ -323,6 +323,26 @@ class MarketMaker:
         if book is None:
             return
 
+        # CRITICAL: Validate book state before ANY quoting
+        # A crossed or empty book means garbage data - DO NOT TRADE
+        if not book.is_valid():
+            logger.error(
+                f"INVALID ORDERBOOK - refusing to quote. "
+                f"bid={book.best_yes_bid()}, ask={book.best_yes_ask()}"
+            )
+            self.decision_logger.log_error(
+                "invalid_orderbook",
+                {
+                    "best_bid": book.best_yes_bid(),
+                    "best_ask": book.best_yes_ask(),
+                    "yes_bids_count": len(book.yes_bids),
+                    "yes_asks_count": len(book.yes_asks),
+                }
+            )
+            # Pull any existing quotes - we can't safely maintain them
+            await self.execution.pull_quotes(self.ticker)
+            return
+
         # 1. UPDATE METRICS with latency tracking
         with LatencyTimer() as t:
             liq_metrics = analyze_liquidity(book)
@@ -379,6 +399,17 @@ class MarketMaker:
         # Check circuit breaker (max loss / max drawdown)
         if self._check_circuit_breaker(position_state.realized_pnl, position_state.unrealized_pnl):
             await self._emergency_shutdown("Circuit breaker triggered")
+            return
+
+        # Check API error circuit breaker
+        if self.execution.should_halt_on_errors():
+            self.decision_logger.log_error(
+                "api_error_circuit_breaker",
+                {"consecutive_errors": self.execution._consecutive_api_errors}
+            )
+            await self._emergency_shutdown(
+                f"Too many consecutive API errors ({self.execution._consecutive_api_errors})"
+            )
             return
 
         # 2. CHECK IMPULSE (Priority 1) with latency tracking
