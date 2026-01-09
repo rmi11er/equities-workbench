@@ -100,6 +100,8 @@ class RiskConfig:
     """Risk management configuration (V2)."""
     hard_stop_ratio: float = 1.2      # Panic dump at this multiple of max_inventory
     bailout_threshold: int = 1        # Hysteresis cents for reservation crossing
+    max_loss_cents: int = 0           # Shutdown if realized loss exceeds this (0 = disabled)
+    max_drawdown_cents: int = 0       # Shutdown if unrealized drawdown exceeds this (0 = disabled)
 
     def get_hard_stop_inventory(self, max_inventory: int) -> int:
         """Calculate the hard stop inventory level."""
@@ -226,6 +228,8 @@ class Config:
         risk_cfg = RiskConfig(
             hard_stop_ratio=risk_data.get("hard_stop_ratio", 1.2),
             bailout_threshold=risk_data.get("bailout_threshold", 1),
+            max_loss_cents=risk_data.get("max_loss_cents", 0),
+            max_drawdown_cents=risk_data.get("max_drawdown_cents", 0),
         )
 
         impulse_data = data.get("impulse", {})

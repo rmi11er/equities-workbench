@@ -4,13 +4,17 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum, auto
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from .config import StrategyConfig
 from .connector import KalshiConnector, APIError
 from .constants import OrderSide, OrderStatus
 from .types import Order, StrategyOutput
+
+if TYPE_CHECKING:
+    from .decision_log import DecisionLogger, FillEvent
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +58,15 @@ class ExecutionEngine:
     - Execute orders via connector
     """
 
-    def __init__(self, config: StrategyConfig, connector: KalshiConnector):
+    def __init__(
+        self,
+        config: StrategyConfig,
+        connector: KalshiConnector,
+        decision_logger: Optional["DecisionLogger"] = None,
+    ):
         self.config = config
         self.connector = connector
+        self.decision_logger = decision_logger
 
         # State per ticker
         self._quotes: dict[str, QuoteState] = {}
@@ -64,6 +74,7 @@ class ExecutionEngine:
         # P&L tracking
         self._realized_pnl: float = 0.0
         self._avg_entry_price: Optional[float] = None
+        self._last_mid: dict[str, float] = {}  # Track mid for fill context
 
     def get_quote_state(self, ticker: str) -> QuoteState:
         """Get or create quote state for a ticker."""
@@ -430,6 +441,7 @@ class ExecutionEngine:
         side: OrderSide,
         price: int,
         size: int,
+        inventory_before: int = 0,
     ) -> None:
         """
         Handle a fill notification.
@@ -447,9 +459,48 @@ class ExecutionEngine:
                     order.status = OrderStatus.EXECUTED
                 break
 
-        # P&L tracking (simplified)
-        # TODO: More sophisticated P&L calculation with position tracking
-        logger.info(f"Fill: {side.value} {size}@{price} (order {order_id})")
+        # Calculate P&L impact
+        # Buy YES = inventory increases, pay price
+        # Sell YES (buy NO) = inventory decreases, receive 100-price
+        pnl_delta = 0.0
+        if side == OrderSide.BUY:
+            # Bought YES at price, position gets longer
+            pnl_delta = -price * size  # Spent money
+            inventory_after = inventory_before + size
+        else:
+            # Sold YES at price, position gets shorter
+            pnl_delta = price * size  # Received money
+            inventory_after = inventory_before - size
+
+        self._realized_pnl += pnl_delta
+
+        # Log the fill with full context
+        if self.decision_logger:
+            from .decision_log import FillEvent
+            fill_event = FillEvent(
+                timestamp=datetime.now().isoformat(),
+                order_id=order_id,
+                side=side.value,
+                price=price,
+                size=size,
+                inventory_before=inventory_before,
+                inventory_after=inventory_after,
+                realized_pnl_delta=pnl_delta,
+                total_realized_pnl=self._realized_pnl,
+                mid_at_fill=self._last_mid.get(ticker, 50.0),
+                our_bid_at_fill=state.last_bid_price,
+                our_ask_at_fill=state.last_ask_price,
+            )
+            self.decision_logger.log_fill(fill_event)
+
+        logger.info(
+            f"Fill: {side.value} {size}@{price} (order {order_id}) "
+            f"inv: {inventory_before}->{inventory_after}, pnl_delta={pnl_delta:.0f}c"
+        )
+
+    def update_market_context(self, ticker: str, mid: float) -> None:
+        """Update market context for fill logging."""
+        self._last_mid[ticker] = mid
 
     @property
     def realized_pnl(self) -> float:

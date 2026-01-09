@@ -5,6 +5,8 @@ import logging
 import time
 from typing import Optional
 
+from datetime import datetime
+
 from .config import Config
 from .connector import KalshiConnector, WSMessage
 from .constants import STALE_DATA_THRESHOLD_SEC
@@ -17,6 +19,11 @@ from .taker import ImpulseEngine, BailoutAction
 from .types import Position, StrategyOutput
 from .liquidity import analyze_liquidity, compute_adaptive_params
 from .lip import LIPManager, LIPConstraints
+from .decision_log import (
+    DecisionLogger, LatencyTimer, TickLatencyTracker,
+    QuoteDecision, ImpulseEvent, FillEvent,
+    MarketState, PositionState, LatencyBreakdown,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +44,20 @@ class MarketMaker:
         self.config = config
         self.ticker = config.market_ticker
 
+        # Decision logging (initialize first so it can be passed to other components)
+        self.decision_logger = DecisionLogger(
+            log_path=config.logging.ops_log_path.replace("ops.log", "decisions.jsonl")
+        )
+
         # Core components
         self.connector = KalshiConnector(config)
         self.orderbook_manager = OrderBookManager(config.volatility)
         self.strategy = StoikovStrategy(config.strategy)
-        self.execution = ExecutionEngine(config.strategy, self.connector)
+        self.execution = ExecutionEngine(
+            config.strategy,
+            self.connector,
+            decision_logger=self.decision_logger,
+        )
         self.alpha_engine = AlphaEngine()
         self.log_manager = LogManager(config.logging)
         self.lip_manager = LIPManager(self.connector, max_tick_cap=config.lip.max_tick_cap)
@@ -62,6 +78,10 @@ class MarketMaker:
         self._market_expiry_ts: Optional[float] = None  # Unix timestamp of market expiry
         self._last_reservation_price: float = 50.0  # Track reservation for impulse checks
 
+        # Circuit breaker state
+        self._peak_pnl: float = 0.0  # High water mark for drawdown calculation
+        self._circuit_breaker_triggered = False
+
     # -------------------------------------------------------------------------
     # Lifecycle
     # -------------------------------------------------------------------------
@@ -72,6 +92,7 @@ class MarketMaker:
 
         # Start logging
         self.log_manager.start()
+        self.decision_logger.start()
 
         # Start connector
         await self.connector.start()
@@ -122,6 +143,7 @@ class MarketMaker:
         # Stop components
         await self.alpha_engine.stop()
         await self.connector.stop()
+        self.decision_logger.stop()
         self.log_manager.stop()
 
         logger.info("Market maker stopped")
@@ -293,167 +315,241 @@ class MarketMaker:
             await asyncio.sleep(sleep_time)
 
     async def _tick(self) -> None:
-        """Single strategy tick."""
-        tick_start = time.monotonic()
+        """Single strategy tick with comprehensive decision logging."""
+        latency_tracker = TickLatencyTracker()
 
         # Get order book
         book = self.orderbook_manager.get(self.ticker)
         if book is None:
             return
 
-        # 1. UPDATE METRICS
-        # Analyze liquidity
-        liq_metrics = analyze_liquidity(book)
-        adaptive = compute_adaptive_params(liq_metrics)
+        # 1. UPDATE METRICS with latency tracking
+        with LatencyTimer() as t:
+            liq_metrics = analyze_liquidity(book)
+            adaptive = compute_adaptive_params(liq_metrics)
+            best_bid = book.best_yes_bid()
+            best_ask = book.best_yes_ask()
+        latency_tracker.record_orderbook_update(t.elapsed_us)
 
-        # Get best bid/ask for impulse checks
-        best_bid = book.best_yes_bid()
-        best_ask = book.best_yes_ask()
+        # Get effective pricing (depth-based) with latency tracking
+        with LatencyTimer() as t:
+            min_depth = self.config.strategy.effective_depth_contracts
+            eff_bid, eff_ask = book.get_effective_quote(min_depth)
+            effective_mid = (eff_bid + eff_ask) / 2.0
+            effective_spread = float(eff_ask - eff_bid)
+        latency_tracker.record_effective_quote(t.elapsed_us)
 
-        # Get effective pricing (depth-based)
-        min_depth = self.config.strategy.effective_depth_contracts
-        eff_bid, eff_ask = book.get_effective_quote(min_depth)
-        effective_mid = (eff_bid + eff_ask) / 2.0
-        effective_spread = float(eff_ask - eff_bid)
+        # Simple mid for comparison
+        simple_mid = liq_metrics.mid_price if liq_metrics.mid_price else 50.0
 
         # Get mid price - use effective mid, fall back to simple mid, then 50
         mid = effective_mid
         if liq_metrics.is_empty:
             mid = 50.0
 
-        if liq_metrics.is_empty and self._tick_count % 100 == 0:
-            logger.info("Empty orderbook - quoting wide at 1/99")
-        elif self._tick_count % 100 == 0:
-            logger.info(
-                f"Liquidity score={liq_metrics.liquidity_score:.2f}, "
-                f"spread_mult={adaptive.spread_multiplier:.1f}, "
-                f"size_mult={adaptive.size_multiplier:.1f}, "
-                f"eff_mid={effective_mid:.1f}, eff_spread={effective_spread:.0f}"
-            )
-
-        # Get volatility
+        # Get volatility and other metrics
         volatility = self.orderbook_manager.get_volatility(self.ticker)
-
-        # Get external skew
         external_skew = self.alpha_engine.get_external_skew(self.ticker)
-
-        # Get current inventory
         inventory = self._position.net_position
+        ofi = book.get_ofi(levels=3)
 
         # Determine regime
         regime = "PEGGED" if self.config.pegged_mode.enabled else "STANDARD"
 
-        # 2. CHECK IMPULSE (Priority 1)
-        if self.config.impulse.enabled:
-            bailout_action = self.impulse_engine.check_bailout(
-                inventory=inventory,
-                reservation_price=self._last_reservation_price,
-                best_bid=best_bid,
-                best_ask=best_ask,
-                regime=regime,
-            )
+        # Build market state for logging
+        market_state = MarketState(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            effective_bid=eff_bid,
+            effective_ask=eff_ask,
+            effective_mid=effective_mid,
+            effective_spread=effective_spread,
+            simple_mid=simple_mid,
+            volatility=volatility,
+            ofi=ofi,
+            liquidity_score=liq_metrics.liquidity_score,
+        )
 
-            if bailout_action:
-                logger.warning(f"IMPULSE TRIGGERED: {bailout_action}")
-                await self._execute_bailout(bailout_action)
-                # Skip quoting this tick to process the dump
-                self._tick_count += 1
-                return
+        position_state = PositionState(
+            inventory=inventory,
+            unrealized_pnl=self.execution.get_unrealized_pnl(self.ticker, mid, inventory),
+            realized_pnl=self.execution.realized_pnl,
+        )
 
-        # 3. SELECT STRATEGY (Priority 2)
-        if self.config.pegged_mode.enabled:
-            # Use Pegged Strategy (Fixed Price, Max Size)
-            quote_state = self.execution.get_quote_state(self.ticker)
-            current_bid_size = quote_state.bid_order.remaining if quote_state.bid_order else 0
-            current_ask_size = quote_state.ask_order.remaining if quote_state.ask_order else 0
+        # Check circuit breaker (max loss / max drawdown)
+        if self._check_circuit_breaker(position_state.realized_pnl, position_state.unrealized_pnl):
+            await self._emergency_shutdown("Circuit breaker triggered")
+            return
 
-            quotes = self.pegged_strategy.generate_quotes(
-                inventory=inventory,
-                current_bid_size=current_bid_size,
-                current_ask_size=current_ask_size,
-            )
-            should_bid, should_ask = self.pegged_strategy.should_quote(inventory)
-
-        else:
-            # Use Stoikov Strategy with Effective Depth Pricing
-            if liq_metrics.is_empty:
-                # Empty book: quote as wide as possible (1/99) with full size
-                # Max loss per contract is 1¢, potential gain is huge
-                quotes = StrategyOutput(
-                    bid_price=1,
-                    ask_price=99,
-                    bid_size=self.config.strategy.max_order_size,
-                    ask_size=self.config.strategy.max_order_size,
-                    reservation_price=50.0,
-                    spread=98.0,
-                    inventory_skew=0.0,
-                )
-            else:
-                # Generate base quotes using effective mid price
-                quotes = self.strategy.generate_quotes(
-                    mid_price=effective_mid,  # Use effective mid for depth-based pricing
+        # 2. CHECK IMPULSE (Priority 1) with latency tracking
+        with LatencyTimer() as t:
+            bailout_action = None
+            if self.config.impulse.enabled:
+                bailout_action = self.impulse_engine.check_bailout(
                     inventory=inventory,
-                    volatility=volatility,
-                    external_skew=external_skew,
-                    expiry_ts=self._market_expiry_ts,
-                    effective_spread=effective_spread,
+                    reservation_price=self._last_reservation_price,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    regime=regime,
                 )
+        latency_tracker.record_impulse_check(t.elapsed_us)
 
-                # Apply liquidity-adaptive adjustments
-                adjusted_spread = (quotes.ask_price - quotes.bid_price) * adaptive.spread_multiplier
-                half_spread = int(adjusted_spread / 2)
+        # Log impulse check
+        impulse_event = ImpulseEvent(
+            timestamp=datetime.now().isoformat(),
+            tick_number=self._tick_count,
+            triggered=bailout_action is not None,
+            reason=bailout_action.reason.name if bailout_action else "",
+            inventory=inventory,
+            reservation_price=self._last_reservation_price,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            ofi=ofi,
+            hard_stop_threshold=self.impulse_engine._hard_stop_inventory,
+            bailout_side=bailout_action.side if bailout_action else "",
+            bailout_quantity=bailout_action.quantity if bailout_action else 0,
+            bailout_price=bailout_action.aggressive_price if bailout_action else 0,
+        )
 
-                # Recalculate prices around reservation
-                new_bid = max(1, int(quotes.reservation_price - half_spread))
-                new_ask = min(99, int(quotes.reservation_price + half_spread))
+        if bailout_action:
+            self.decision_logger.log_impulse_check(impulse_event)
+            logger.warning(f"IMPULSE TRIGGERED: {bailout_action}")
+            await self._execute_bailout(bailout_action)
+            self._tick_count += 1
+            return
 
-                # Ensure no cross
-                if new_bid >= new_ask:
-                    new_bid = max(1, int(quotes.reservation_price) - 1)
-                    new_ask = min(99, int(quotes.reservation_price) + 1)
+        # 3. SELECT STRATEGY (Priority 2) with latency tracking
+        with LatencyTimer() as t:
+            raw_quotes = None  # Store pre-adjustment quotes for logging
 
-                # Adjust sizes
-                new_bid_size = max(1, int(quotes.bid_size * adaptive.size_multiplier))
-                new_ask_size = max(1, int(quotes.ask_size * adaptive.size_multiplier))
+            if self.config.pegged_mode.enabled:
+                # Use Pegged Strategy
+                quote_state = self.execution.get_quote_state(self.ticker)
+                current_bid_size = quote_state.bid_order.remaining if quote_state.bid_order else 0
+                current_ask_size = quote_state.ask_order.remaining if quote_state.ask_order else 0
 
-                # Cap at max order size
-                max_size = self.config.strategy.max_order_size
-                new_bid_size = min(new_bid_size, max_size)
-                new_ask_size = min(new_ask_size, max_size)
-
-                quotes = StrategyOutput(
-                    bid_price=new_bid,
-                    ask_price=new_ask,
-                    bid_size=new_bid_size,
-                    ask_size=new_ask_size,
-                    reservation_price=quotes.reservation_price,
-                    spread=float(new_ask - new_bid),
-                    inventory_skew=quotes.inventory_skew,
+                quotes = self.pegged_strategy.generate_quotes(
+                    inventory=inventory,
+                    current_bid_size=current_bid_size,
+                    current_ask_size=current_ask_size,
                 )
+                raw_quotes = quotes  # No adjustment in pegged mode
+                should_bid, should_ask = self.pegged_strategy.should_quote(inventory)
 
-            # Check if we should quote each side (Stoikov limits)
-            should_bid, should_ask = self.strategy.should_quote(inventory)
+            else:
+                # Use Stoikov Strategy with Effective Depth Pricing
+                if liq_metrics.is_empty:
+                    quotes = StrategyOutput(
+                        bid_price=1,
+                        ask_price=99,
+                        bid_size=self.config.strategy.max_order_size,
+                        ask_size=self.config.strategy.max_order_size,
+                        reservation_price=50.0,
+                        spread=98.0,
+                        inventory_skew=0.0,
+                    )
+                    raw_quotes = quotes
+                else:
+                    # Generate base quotes
+                    quotes = self.strategy.generate_quotes(
+                        mid_price=effective_mid,
+                        inventory=inventory,
+                        volatility=volatility,
+                        external_skew=external_skew,
+                        expiry_ts=self._market_expiry_ts,
+                        effective_spread=effective_spread,
+                    )
+                    raw_quotes = quotes  # Store before adjustments
+
+                    # Apply liquidity-adaptive adjustments
+                    adjusted_spread = (quotes.ask_price - quotes.bid_price) * adaptive.spread_multiplier
+                    half_spread = int(adjusted_spread / 2)
+
+                    new_bid = max(1, int(quotes.reservation_price - half_spread))
+                    new_ask = min(99, int(quotes.reservation_price + half_spread))
+
+                    if new_bid >= new_ask:
+                        new_bid = max(1, int(quotes.reservation_price) - 1)
+                        new_ask = min(99, int(quotes.reservation_price) + 1)
+
+                    new_bid_size = max(1, int(quotes.bid_size * adaptive.size_multiplier))
+                    new_ask_size = max(1, int(quotes.ask_size * adaptive.size_multiplier))
+
+                    max_size = self.config.strategy.max_order_size
+                    new_bid_size = min(new_bid_size, max_size)
+                    new_ask_size = min(new_ask_size, max_size)
+
+                    quotes = StrategyOutput(
+                        bid_price=new_bid,
+                        ask_price=new_ask,
+                        bid_size=new_bid_size,
+                        ask_size=new_ask_size,
+                        reservation_price=quotes.reservation_price,
+                        spread=float(new_ask - new_bid),
+                        inventory_skew=quotes.inventory_skew,
+                    )
+
+                should_bid, should_ask = self.strategy.should_quote(inventory)
+        latency_tracker.record_strategy_calc(t.elapsed_us)
 
         # Store reservation price for next impulse check
         self._last_reservation_price = quotes.reservation_price
 
-        # Apply LIP constraints if active (both modes)
+        # Apply LIP constraints if active with latency tracking
+        lip_adjusted = False
         lip_constraints = self.lip_manager.get_constraints(self.ticker)
-        if lip_constraints and lip_constraints.is_active:
-            quotes = self._apply_lip_constraints(quotes, lip_constraints, book)
+        with LatencyTimer() as t:
+            if lip_constraints and lip_constraints.is_active:
+                quotes = self._apply_lip_constraints(quotes, lip_constraints, book)
+                lip_adjusted = True
+        latency_tracker.record_lip_adjustment(t.elapsed_us)
 
-        # 4. EXECUTE
-        await self.execution.update_quotes(
-            ticker=self.ticker,
-            target=quotes,
+        # 4. EXECUTE with latency tracking
+        with LatencyTimer() as t:
+            await self.execution.update_quotes(
+                ticker=self.ticker,
+                target=quotes,
+                should_bid=should_bid,
+                should_ask=should_ask,
+            )
+        latency_tracker.record_execution(t.elapsed_us)
+
+        # Finalize latency tracking
+        latency_breakdown = latency_tracker.finalize()
+
+        # Build and log the quote decision
+        decision = QuoteDecision(
+            timestamp=datetime.now().isoformat(),
+            tick_number=self._tick_count,
+            regime=regime,
+            market=market_state,
+            position=position_state,
+            reservation_price=raw_quotes.reservation_price if raw_quotes else 0,
+            raw_bid=raw_quotes.bid_price if raw_quotes else 0,
+            raw_ask=raw_quotes.ask_price if raw_quotes else 0,
+            raw_spread=raw_quotes.spread if raw_quotes else 0,
+            inventory_skew=raw_quotes.inventory_skew if raw_quotes else 0,
+            liquidity_spread_mult=adaptive.spread_multiplier,
+            liquidity_size_mult=adaptive.size_multiplier,
+            lip_adjusted=lip_adjusted,
+            lip_min_size=lip_constraints.min_size if lip_constraints else 0,
+            lip_max_distance=lip_constraints.max_distance if lip_constraints else 0,
+            final_bid=quotes.bid_price,
+            final_ask=quotes.ask_price,
+            final_bid_size=quotes.bid_size,
+            final_ask_size=quotes.ask_size,
             should_bid=should_bid,
             should_ask=should_ask,
+            update_reason="tick",
+            latency=latency_breakdown,
         )
+        self.decision_logger.log_quote_update(decision)
 
-        # Calculate latency
-        latency_ms = (time.monotonic() - tick_start) * 1000
+        # Update market context for fill logging
+        self.execution.update_market_context(self.ticker, mid)
 
-        # Record to tape
+        # Record to tape (legacy format)
+        latency_ms = latency_breakdown.total_tick_us / 1000.0
         state = self.execution.get_quote_state(self.ticker)
         self.log_manager.record_tick(
             ticker=self.ticker,
@@ -461,18 +557,16 @@ class MarketMaker:
             my_bid=state.last_bid_price,
             my_ask=state.last_ask_price,
             inventory=inventory,
-            unrealized_pnl=self.execution.get_unrealized_pnl(
-                self.ticker, mid, inventory
-            ),
-            realized_pnl=self.execution.realized_pnl,
+            unrealized_pnl=position_state.unrealized_pnl,
+            realized_pnl=position_state.realized_pnl,
             latency_ms=latency_ms,
             volatility=volatility,
         )
 
         self._tick_count += 1
 
-        # Record LIP snapshot (every ~1 second, matching Kalshi's snapshot rate)
-        if self._tick_count % 10 == 0:  # Every 10 ticks = ~1 second
+        # Record LIP snapshot (every ~1 second)
+        if self._tick_count % 10 == 0:
             self.lip_manager.record_snapshot(
                 ticker=self.ticker,
                 our_bid_size=quotes.bid_size if should_bid else 0,
@@ -483,17 +577,19 @@ class MarketMaker:
                 best_ask=best_ask,
             )
 
-        # Periodic logging
+        # Periodic console logging
         if self._tick_count % 100 == 0:
             mode_str = "PEGGED" if self.config.pegged_mode.enabled else "STOIKOV"
             logger.info(
                 f"Tick {self._tick_count} [{mode_str}]: mid={mid:.1f}, "
                 f"bid={quotes.bid_price}, ask={quotes.ask_price}, "
                 f"inv={inventory}, vol={volatility:.2f}, "
-                f"latency={latency_ms:.1f}ms"
+                f"latency={latency_ms:.1f}ms "
+                f"(ob={latency_breakdown.orderbook_update_us}us, "
+                f"strat={latency_breakdown.strategy_calc_us}us, "
+                f"exec={latency_breakdown.execution_us}us)"
             )
 
-            # Log LIP status if active
             lip_status = self.lip_manager.get_status(self.ticker)
             if lip_status.get("active"):
                 logger.info(
@@ -522,6 +618,66 @@ class MarketMaker:
             logger.info(f"Bailout IOC sent: order_id={result.get('order_id')}")
         else:
             logger.error(f"Bailout IOC failed: {result.get('error')}")
+
+    def _check_circuit_breaker(self, realized_pnl: float, unrealized_pnl: float) -> bool:
+        """
+        Check if circuit breaker should trigger and shutdown.
+
+        Returns:
+            True if circuit breaker triggered, False otherwise
+        """
+        if self._circuit_breaker_triggered:
+            return True  # Already triggered
+
+        total_pnl = realized_pnl + unrealized_pnl
+
+        # Update peak P&L for drawdown calculation
+        if total_pnl > self._peak_pnl:
+            self._peak_pnl = total_pnl
+
+        # Check max loss (realized only)
+        max_loss = self.config.risk.max_loss_cents
+        if max_loss > 0 and realized_pnl < -max_loss:
+            logger.critical(
+                f"CIRCUIT BREAKER: Max loss exceeded! "
+                f"Realized P&L: {realized_pnl:.0f}c < -{max_loss}c limit"
+            )
+            self._circuit_breaker_triggered = True
+            self.decision_logger.log_error(
+                "circuit_breaker_max_loss",
+                {"realized_pnl": realized_pnl, "limit": max_loss}
+            )
+            return True
+
+        # Check max drawdown (from peak)
+        max_dd = self.config.risk.max_drawdown_cents
+        if max_dd > 0:
+            drawdown = self._peak_pnl - total_pnl
+            if drawdown > max_dd:
+                logger.critical(
+                    f"CIRCUIT BREAKER: Max drawdown exceeded! "
+                    f"Drawdown: {drawdown:.0f}c > {max_dd}c limit "
+                    f"(peak={self._peak_pnl:.0f}c, current={total_pnl:.0f}c)"
+                )
+                self._circuit_breaker_triggered = True
+                self.decision_logger.log_error(
+                    "circuit_breaker_max_drawdown",
+                    {"drawdown": drawdown, "limit": max_dd, "peak": self._peak_pnl}
+                )
+                return True
+
+        return False
+
+    async def _emergency_shutdown(self, reason: str) -> None:
+        """Emergency shutdown - cancel all orders and stop."""
+        logger.critical(f"EMERGENCY SHUTDOWN: {reason}")
+
+        try:
+            await self.execution.cancel_all(self.ticker)
+        except Exception as e:
+            logger.error(f"Failed to cancel orders during shutdown: {e}")
+
+        self._running = False
 
     # -------------------------------------------------------------------------
     # Monitoring
