@@ -449,26 +449,41 @@ class ExecutionEngine:
         """
         Cancel all orders (panic mode).
 
+        Uses individual cancels as primary method since batch cancel
+        endpoint may not exist on all Kalshi API versions.
+
         Args:
             ticker: If provided, only cancel for this ticker
         """
         logger.warning(f"CANCEL ALL triggered for ticker={ticker}")
 
+        # Always use individual cancels - more reliable
+        cancelled_count = 0
+        failed_count = 0
+
         try:
-            await self.connector.cancel_all_orders(ticker)
+            orders = await self.connector.get_orders(ticker)
+            resting_orders = [o for o in orders.get("orders", []) if o.get("status") == "resting"]
+
+            if not resting_orders:
+                logger.info("No resting orders to cancel")
+            else:
+                logger.info(f"Found {len(resting_orders)} resting orders to cancel")
+
+                for order in resting_orders:
+                    order_id = order.get("order_id")
+                    try:
+                        await self.connector.cancel_order(order_id)
+                        cancelled_count += 1
+                        logger.info(f"Cancelled order {order_id}")
+                    except APIError as cancel_err:
+                        failed_count += 1
+                        logger.error(f"Failed to cancel order {order_id}: {cancel_err}")
+
+                logger.info(f"Cancel complete: {cancelled_count} cancelled, {failed_count} failed")
+
         except APIError as e:
-            # Batch cancel might not exist - try canceling individually
-            logger.warning(f"Batch cancel failed ({e.status}), trying individual cancels")
-            try:
-                orders = await self.connector.get_orders(ticker)
-                for order in orders.get("orders", []):
-                    if order.get("status") == "resting":
-                        try:
-                            await self.connector.cancel_order(order["order_id"])
-                        except APIError:
-                            pass
-            except APIError as e2:
-                logger.error(f"Cancel all failed: {e2}")
+            logger.error(f"Failed to fetch orders for cancel: {e}")
 
         # Clear our state
         if ticker:

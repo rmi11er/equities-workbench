@@ -57,5 +57,6 @@ MAX_RECONNECT_ATTEMPTS = 10
 INITIAL_BACKOFF_SEC = 1.0
 MAX_BACKOFF_SEC = 60.0
 
-# Stale data threshold
-STALE_DATA_THRESHOLD_SEC = 5.0
+# Stale data threshold - increased for illiquid sports markets
+# Markets with low activity may not have orderbook updates for extended periods
+STALE_DATA_THRESHOLD_SEC = 30.0

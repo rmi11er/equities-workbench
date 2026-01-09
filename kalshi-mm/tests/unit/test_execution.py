@@ -261,6 +261,7 @@ class TestExecution:
         connector.amend_order = AsyncMock(return_value={})
         connector.cancel_order = AsyncMock(return_value={})
         connector.cancel_all_orders = AsyncMock(return_value={})
+        connector.get_orders = AsyncMock(return_value={"orders": []})
         return connector
 
     @pytest.fixture
@@ -313,7 +314,20 @@ class TestExecution:
 
     @pytest.mark.asyncio
     async def test_cancel_all(self, engine, mock_connector):
-        """Test cancel all orders."""
+        """Test cancel all orders uses individual cancels."""
+        # Setup mock to return resting orders
+        mock_connector.get_orders = AsyncMock(return_value={
+            "orders": [
+                {"order_id": "order-1", "status": "resting"},
+                {"order_id": "order-2", "status": "resting"},
+                {"order_id": "order-3", "status": "executed"},  # Should be skipped
+            ]
+        })
+
         await engine.cancel_all("TEST")
 
-        mock_connector.cancel_all_orders.assert_called_once_with("TEST")
+        # Should fetch orders and cancel only resting ones
+        mock_connector.get_orders.assert_called_once_with("TEST")
+        assert mock_connector.cancel_order.call_count == 2
+        mock_connector.cancel_order.assert_any_call("order-1")
+        mock_connector.cancel_order.assert_any_call("order-2")
