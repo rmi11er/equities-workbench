@@ -139,7 +139,8 @@ class PeggedModeConfig:
 class Config:
     """Root configuration object."""
     environment: Environment = Environment.DEMO
-    market_ticker: str = "TODO"
+    market_ticker: str = "TODO"  # Single market (backward compat)
+    market_tickers: list = field(default_factory=list)  # Multi-market mode
 
     credentials: CredentialsConfig = field(default_factory=CredentialsConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
@@ -152,6 +153,25 @@ class Config:
     impulse: ImpulseConfig = field(default_factory=ImpulseConfig)
     microstructure: MicrostructureConfig = field(default_factory=MicrostructureConfig)
     pegged_mode: PeggedModeConfig = field(default_factory=PeggedModeConfig)
+
+    @property
+    def tickers(self) -> list:
+        """
+        Get list of tickers to trade.
+
+        Returns market_tickers if set, otherwise falls back to [market_ticker].
+        This provides backward compatibility with single-market configs.
+        """
+        if self.market_tickers:
+            return self.market_tickers
+        if self.market_ticker and self.market_ticker != "TODO":
+            return [self.market_ticker]
+        return []
+
+    @property
+    def is_multi_market(self) -> bool:
+        """Check if running in multi-market mode."""
+        return len(self.tickers) > 1
 
     @classmethod
     def from_toml(cls, path: Union[str, Path]) -> "Config":
@@ -257,9 +277,15 @@ class Config:
             reload_threshold=pegged_data.get("reload_threshold", 0.8),
         )
 
+        # Parse market tickers (multi-market support)
+        market_tickers = data.get("market_tickers", [])
+        if not isinstance(market_tickers, list):
+            market_tickers = []
+
         return cls(
             environment=environment,
             market_ticker=data.get("market_ticker", "TODO"),
+            market_tickers=market_tickers,
             credentials=credentials,
             strategy=strategy,
             volatility=volatility,

@@ -376,7 +376,7 @@ class ExecutionEngine:
                         price=api_price,
                     )
                     if not is_valid:
-                        logger.error(f"ORDER BLOCKED: {error_msg} (would be {side_str}@{api_price})")
+                        logger.warning(f"Quote skipped (would cross): {error_msg}")
                         continue  # Skip this order
 
                     resp = await self.connector.create_order(
@@ -479,13 +479,20 @@ class ExecutionEngine:
                     except APIError as cancel_err:
                         failed_count += 1
                         logger.error(f"Failed to cancel order {order_id}: {cancel_err}")
+                    except Exception as e:
+                        # Network errors (DNS, connection, etc.)
+                        failed_count += 1
+                        logger.error(f"Network error cancelling order {order_id}: {e}")
 
                 logger.info(f"Cancel complete: {cancelled_count} cancelled, {failed_count} failed")
 
         except APIError as e:
             logger.error(f"Failed to fetch orders for cancel: {e}")
+        except Exception as e:
+            # Network errors (DNS timeout, connection refused, etc.)
+            logger.error(f"Network error during cancel_all: {type(e).__name__}: {e}")
 
-        # Clear our state
+        # Clear our state regardless of success (assume orders may be gone)
         if ticker:
             self._quotes.pop(ticker, None)
         else:

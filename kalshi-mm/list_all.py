@@ -9,7 +9,7 @@ from src.connector import KalshiConnector
 # ------------------------------------------------------------------------------
 # Configuration & Constants
 # ------------------------------------------------------------------------------
-SERIES_FILTER = "KXNCAAF"  # Target College Football. Change to "KXNFL" for NFL.
+SERIES_FILTER = "KXNFL"  # Target College Football. Change to "KXNFL" for NFL.
 PAGE_LIMIT    = 200        # Max allowed by Kalshi API
 
 class MarketScanner:
@@ -168,15 +168,8 @@ class MarketScanner:
                 print("   (No markets found for this event)")
                 continue
 
-            # Sort Markets: Winner -> Spread -> Total -> Props
-            def sort_priority(m):
-                t = m.get("ticker", "")
-                if "GAME" in t: return 0
-                if "SPREAD" in t: return 1
-                if "TOTAL" in t: return 2
-                return 3
-
-            sorted_markets = sorted(markets, key=sort_priority)
+            # Sort Markets by volume (descending) - most active markets first
+            sorted_markets = sorted(markets, key=lambda m: m.get("volume", 0) or 0, reverse=True)
 
             for m in sorted_markets:
                 ticker = m.get("ticker", "")

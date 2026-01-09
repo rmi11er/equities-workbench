@@ -369,6 +369,7 @@ class TestEffectiveQuote:
         # min_depth = 100 exceeds total depth
         eff_bid, eff_ask = book.get_effective_quote(min_depth=100)
 
-        # Should return worst available prices
-        assert eff_bid == 30  # Worst (lowest) bid
-        assert eff_ask == 45  # Worst (highest) ask
+        # Should return BEST available prices (actual BBO) for thin books
+        # This ensures we never generate quotes that cross the actual market
+        assert eff_bid == 35  # Best (highest) bid
+        assert eff_ask == 40  # Best (lowest) ask

@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.config import load_config, Config
 from src.constants import Environment
 from src.market_maker import MarketMaker
+from src.multi_market import MultiMarketOrchestrator
 from src.run_context import create_run_context
 
 
@@ -82,9 +83,10 @@ async def main() -> int:
         print(f"Ticker override: {config.market_ticker}")
 
     # Validate configuration
-    if config.market_ticker == "TODO":
-        print("ERROR: market_ticker not configured")
-        print("Set it in config.toml or use --ticker flag")
+    tickers = config.tickers
+    if not tickers:
+        print("ERROR: No tickers configured")
+        print("Set market_ticker or market_tickers in config.toml, or use --ticker flag")
         return 1
 
     if config.credentials.api_key_id == "TODO":
@@ -92,10 +94,14 @@ async def main() -> int:
         print("Set api_key_id and private_key_path in config.toml")
         return 1
 
+    # Determine mode (single vs multi-market)
+    is_multi_market = config.is_multi_market
+    ticker_display = ", ".join(tickers) if is_multi_market else tickers[0]
+
     # Create run context for versioned logging
     run_context = create_run_context(
         base_log_dir=config.logging.base_log_dir,
-        ticker=config.market_ticker,
+        ticker=ticker_display,
         environment=config.environment.name,
         config=config,
     )
@@ -103,8 +109,12 @@ async def main() -> int:
     # Print startup banner with version info
     print(run_context.get_startup_banner())
 
-    # Create market maker with run context
-    mm = MarketMaker(config, run_context=run_context)
+    # Create market maker (single or multi-market)
+    if is_multi_market:
+        print(f"\nMulti-market mode: {len(tickers)} markets")
+        mm = MultiMarketOrchestrator(config, run_context=run_context)
+    else:
+        mm = MarketMaker(config, run_context=run_context)
 
     # Setup signal handlers
     loop = asyncio.get_event_loop()
@@ -120,7 +130,12 @@ async def main() -> int:
     # Run market maker
     print(f"\nStarting market maker:")
     print(f"  Environment: {config.environment.name}")
-    print(f"  Ticker: {config.market_ticker}")
+    if is_multi_market:
+        print(f"  Markets ({len(tickers)}):")
+        for t in tickers:
+            print(f"    - {t}")
+    else:
+        print(f"  Ticker: {tickers[0]}")
     print(f"  Risk Aversion: {config.strategy.risk_aversion}")
     print(f"  Max Inventory: {config.strategy.max_inventory}")
     print()

@@ -145,12 +145,23 @@ class MarketMaker:
         logger.info("Stopping market maker...")
         self._running = False
 
-        # Cancel all orders
-        await self.execution.cancel_all(self.ticker)
+        # Cancel all orders (with error handling for network issues)
+        try:
+            await self.execution.cancel_all(self.ticker)
+        except Exception as e:
+            logger.error(f"Error during order cancellation on stop: {e}")
 
-        # Stop components
-        await self.alpha_engine.stop()
-        await self.connector.stop()
+        # Stop components (with error handling)
+        try:
+            await self.alpha_engine.stop()
+        except Exception as e:
+            logger.error(f"Error stopping alpha engine: {e}")
+
+        try:
+            await self.connector.stop()
+        except Exception as e:
+            logger.error(f"Error stopping connector: {e}")
+
         self.decision_logger.stop()
         self.log_manager.stop()
 
@@ -739,11 +750,18 @@ class MarketMaker:
     # -------------------------------------------------------------------------
 
     async def _stale_data_monitor(self) -> None:
-        """Monitor for stale data and pull quotes if detected."""
-        stale_count = 0
+        """
+        Monitor for stale data and log warnings.
+
+        For illiquid markets, we do NOT cancel orders just because there's no
+        activity - markets can go hours without trades. We only log warnings
+        to alert the operator. Quote pulling happens on actual error conditions
+        (like sequence gaps or reconnects), not on inactivity.
+        """
+        stale_logged = False
 
         while self._running:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(5.0)  # Check every 5 seconds, not every 1 second
 
             if self._last_tick_time == 0:
                 continue
@@ -751,17 +769,14 @@ class MarketMaker:
             elapsed = time.monotonic() - self._last_tick_time
 
             if elapsed > STALE_DATA_THRESHOLD_SEC:
-                stale_count += 1
-
-                # Only warn occasionally, not every 5 seconds
-                if stale_count == 1 or stale_count % 12 == 0:  # First time, then every minute
-                    logger.warning(f"Stale data: {elapsed:.1f}s since last message (market may be illiquid)")
-
-                # Only pull quotes if we actually have orders out
-                state = self.execution.get_quote_state(self.ticker)
-                if state.bid_order or state.ask_order:
-                    await self.execution.pull_quotes(self.ticker)
-
-                self._last_tick_time = time.monotonic()
+                # Log warning once when we first go stale, then every 5 minutes
+                if not stale_logged:
+                    logger.warning(
+                        f"No orderbook updates for {elapsed:.0f}s - market may be illiquid. "
+                        f"Quotes remain active (cancel manually if needed)."
+                    )
+                    stale_logged = True
+                elif elapsed > 300 and int(elapsed) % 300 < 5:  # Every 5 minutes
+                    logger.warning(f"Still no orderbook updates ({elapsed/60:.1f} min)")
             else:
-                stale_count = 0
+                stale_logged = False
