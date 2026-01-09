@@ -275,10 +275,10 @@ class KalshiConnector:
 
     async def cancel_all_orders(self, ticker: Optional[str] = None) -> dict:
         """Cancel all orders, optionally filtered by ticker."""
-        data = {}
+        path = "/portfolio/orders"
         if ticker:
-            data["ticker"] = ticker
-        return await self._request("DELETE", "/portfolio/orders", data, is_write=True)
+            path += f"?ticker={ticker}"
+        return await self._request("DELETE", path, is_write=True)
 
     # -------------------------------------------------------------------------
     # WebSocket

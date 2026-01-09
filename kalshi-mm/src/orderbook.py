@@ -43,32 +43,35 @@ class OrderBook:
         Expected format:
         {
             "market_ticker": "...",
-            "yes": [[price, size], ...],  # asks (offers to sell YES)
-            "no": [[price, size], ...]    # asks (offers to sell NO)
+            "yes": [[price, size], ...],  # bids (resting buy orders for YES)
+            "no": [[price, size], ...]    # bids (resting buy orders for NO)
         }
 
-        Note: Kalshi's snapshot shows the offer side.
-        The bid side is derived: if someone offers YES at 60,
-        that's equivalent to bidding NO at 40.
+        Note: Kalshi's snapshot shows resting bid orders.
+        The ask side is derived from the opposite side's bids:
+        - If someone bids YES at 38, equivalent to offering NO at 62
+        - If someone bids NO at 61, equivalent to offering YES at 39
         """
         self.yes_bids.clear()
         self.yes_asks.clear()
         self.no_bids.clear()
         self.no_asks.clear()
 
-        # YES offers (these are asks on the YES side)
+        # YES bids (resting buy orders for YES contracts)
         for level in msg.get("yes", []):
             price, size = level[0], level[1]
-            self.yes_asks[price] = size
-            # Equivalent to NO bid at (100 - price)
-            self.no_bids[100 - price] = size
+            self.yes_bids[price] = size
+            # Implied NO ask at (100 - price)
+            # If someone bids YES at 38, they'd sell NO at 62
+            self.no_asks[100 - price] = size
 
-        # NO offers (these are asks on the NO side)
+        # NO bids (resting buy orders for NO contracts)
         for level in msg.get("no", []):
             price, size = level[0], level[1]
-            self.no_asks[price] = size
-            # Equivalent to YES bid at (100 - price)
-            self.yes_bids[100 - price] = size
+            self.no_bids[price] = size
+            # Implied YES ask at (100 - price)
+            # If someone bids NO at 61, they'd sell YES at 39
+            self.yes_asks[100 - price] = size
 
         self.version += 1
         logger.debug(f"Snapshot applied for {self.ticker}, version={self.version}")
@@ -84,6 +87,9 @@ class OrderBook:
             "delta": -54,  # negative = size decrease, positive = increase
             "side": "yes"  # or "no"
         }
+
+        Deltas update the bid book for the specified side,
+        and the derived ask book on the opposite side.
         """
         price = msg.get("price")
         delta = msg.get("delta", 0)
@@ -94,13 +100,14 @@ class OrderBook:
             return
 
         # Determine which book to update
+        # Deltas are for bid orders on each side
         if side == "yes":
-            book = self.yes_asks
-            mirror_book = self.no_bids
+            book = self.yes_bids
+            mirror_book = self.no_asks  # YES bid implies NO ask
             mirror_price = 100 - price
         else:
-            book = self.no_asks
-            mirror_book = self.yes_bids
+            book = self.no_bids
+            mirror_book = self.yes_asks  # NO bid implies YES ask
             mirror_price = 100 - price
 
         # Update the book

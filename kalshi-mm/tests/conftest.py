@@ -39,20 +39,38 @@ def sample_config():
 
 @pytest.fixture
 def sample_orderbook_snapshot():
-    """Sample orderbook snapshot message."""
+    """Sample orderbook snapshot message.
+
+    Kalshi format: yes/no arrays contain BID orders (resting buy orders).
+    - yes: [[price, size], ...] = bids to buy YES contracts
+    - no: [[price, size], ...] = bids to buy NO contracts
+
+    Derived prices:
+    - YES asks come from NO bids: if NO bid at 55, YES ask at 45
+    - NO asks come from YES bids: if YES bid at 40, NO ask at 60
+
+    This fixture creates:
+    - YES bids: 35, 38, 40 → best YES bid = 40
+    - NO bids: 55, 57, 59 → best YES ask = 100-59 = 41
+    - Spread = 1, Mid = 40.5
+    """
     return {
         "market_ticker": "TEST-TICKER",
-        "yes": [[30, 100], [35, 200], [40, 150]],  # Asks for YES
-        "no": [[55, 100], [60, 200], [65, 150]],   # Asks for NO
+        "yes": [[35, 100], [38, 200], [40, 150]],  # YES bids
+        "no": [[55, 100], [57, 200], [59, 150]],   # NO bids → YES asks at 45, 43, 41
     }
 
 
 @pytest.fixture
 def sample_orderbook_delta():
-    """Sample orderbook delta message."""
+    """Sample orderbook delta message.
+
+    Deltas update BID orders. This delta reduces the YES bid at price 38
+    from 200 to 150 contracts.
+    """
     return {
         "market_ticker": "TEST-TICKER",
-        "price": 35,
+        "price": 38,
         "delta": -50,
         "side": "yes",
     }

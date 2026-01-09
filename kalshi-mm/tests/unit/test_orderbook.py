@@ -16,24 +16,24 @@ class TestOrderBook:
         """Test applying a full snapshot."""
         book.apply_snapshot(sample_orderbook_snapshot)
 
-        # Check YES asks populated
-        assert 30 in book.yes_asks
-        assert book.yes_asks[30] == 100
-        assert book.yes_asks[35] == 200
-        assert book.yes_asks[40] == 150
+        # Check YES bids populated (from "yes" array)
+        assert 35 in book.yes_bids
+        assert book.yes_bids[35] == 100
+        assert book.yes_bids[38] == 200
+        assert book.yes_bids[40] == 150
 
-        # Check NO asks populated
-        assert 55 in book.no_asks
-        assert book.no_asks[55] == 100
+        # Check NO bids populated (from "no" array)
+        assert 55 in book.no_bids
+        assert book.no_bids[55] == 100
 
-        # Check derived bids
-        # YES ask at 30 -> NO bid at 70
-        assert 70 in book.no_bids
-        assert book.no_bids[70] == 100
+        # Check derived asks
+        # YES bid at 40 -> NO ask at 60
+        assert 60 in book.no_asks
+        assert book.no_asks[60] == 150
 
-        # NO ask at 55 -> YES bid at 45
-        assert 45 in book.yes_bids
-        assert book.yes_bids[45] == 100
+        # NO bid at 59 -> YES ask at 41
+        assert 41 in book.yes_asks
+        assert book.yes_asks[41] == 150
 
     def test_apply_delta_reduce(self, book, sample_orderbook_snapshot):
         """Test applying a delta that reduces size."""
@@ -41,7 +41,7 @@ class TestOrderBook:
 
         delta = {
             "market_ticker": "TEST",
-            "price": 35,
+            "price": 38,
             "delta": -50,
             "side": "yes",
         }
@@ -49,7 +49,7 @@ class TestOrderBook:
         book.apply_delta(delta)
 
         # Size should be reduced from 200 to 150
-        assert book.yes_asks[35] == 150
+        assert book.yes_bids[38] == 150
 
     def test_apply_delta_remove_level(self, book, sample_orderbook_snapshot):
         """Test applying a delta that removes a level."""
@@ -57,7 +57,7 @@ class TestOrderBook:
 
         delta = {
             "market_ticker": "TEST",
-            "price": 30,
+            "price": 35,
             "delta": -100,  # Exact size
             "side": "yes",
         }
@@ -65,7 +65,7 @@ class TestOrderBook:
         book.apply_delta(delta)
 
         # Level should be removed
-        assert 30 not in book.yes_asks
+        assert 35 not in book.yes_bids
 
     def test_apply_delta_increase(self, book, sample_orderbook_snapshot):
         """Test applying a delta that increases size."""
@@ -73,7 +73,7 @@ class TestOrderBook:
 
         delta = {
             "market_ticker": "TEST",
-            "price": 35,
+            "price": 38,
             "delta": 100,
             "side": "yes",
         }
@@ -81,7 +81,7 @@ class TestOrderBook:
         book.apply_delta(delta)
 
         # Size should increase from 200 to 300
-        assert book.yes_asks[35] == 300
+        assert book.yes_bids[38] == 300
 
     def test_mid_price(self, book, sample_orderbook_snapshot):
         """Test mid price calculation."""
@@ -89,19 +89,19 @@ class TestOrderBook:
 
         mid = book.mid_price()
 
-        # Best YES bid derived from NO ask at 55 -> YES bid at 45
-        # Best YES ask at 30
-        # Mid = (45 + 30) / 2 = 37.5
-        assert mid == 37.5
+        # Best YES bid = 40 (max of yes array)
+        # Best YES ask = 41 (100 - max of no array = 100 - 59)
+        # Mid = (40 + 41) / 2 = 40.5
+        assert mid == 40.5
 
     def test_best_prices(self, book, sample_orderbook_snapshot):
         """Test best price retrieval."""
         book.apply_snapshot(sample_orderbook_snapshot)
 
-        assert book.best_yes_bid() == 45  # From NO ask at 55
-        assert book.best_yes_ask() == 30  # Direct YES ask
-        assert book.best_no_bid() == 70   # From YES ask at 30
-        assert book.best_no_ask() == 55   # Direct NO ask
+        assert book.best_yes_bid() == 40  # Max of yes array
+        assert book.best_yes_ask() == 41  # 100 - max(no) = 100 - 59
+        assert book.best_no_bid() == 59   # Max of no array
+        assert book.best_no_ask() == 60   # 100 - max(yes) = 100 - 40
 
     def test_spread(self, book, sample_orderbook_snapshot):
         """Test spread calculation."""
@@ -109,12 +109,9 @@ class TestOrderBook:
 
         spread = book.spread()
 
-        # Note: In this case we have YES bid at 45 and YES ask at 30
-        # This is an inverted market (bid > ask), which shouldn't happen
-        # in reality but let's test the math anyway
-        # Actually: best bid = 45, best ask = 30, spread = 30 - 45 = -15
-        # This shows a locked/crossed market in our test data
-        assert spread is not None
+        # Best YES bid = 40, Best YES ask = 41
+        # Spread = 41 - 40 = 1
+        assert spread == 1.0
 
     def test_empty_book_mid_price(self, book):
         """Test mid price when book is empty."""
@@ -221,7 +218,7 @@ class TestOrderBookManager:
 
         book = manager.get("TEST-TICKER")
         assert book is not None
-        assert len(book.yes_asks) > 0
+        assert len(book.yes_bids) > 0
 
     def test_handle_delta_message(self, manager, sample_orderbook_snapshot, sample_orderbook_delta):
         """Test handling delta message."""
@@ -244,7 +241,7 @@ class TestOrderBookManager:
         manager.handle_message(delta_msg)
 
         book = manager.get("TEST-TICKER")
-        assert book.yes_asks[35] == 150  # 200 - 50
+        assert book.yes_bids[38] == 150  # 200 - 50
 
 
 class TestEffectiveQuote:

@@ -61,14 +61,15 @@ class TestIntegration:
         connector.on_message(orderbook_manager.handle_message)
 
         # Send a fresh snapshot after handler is registered
+        # yes/no arrays are BID orders in Kalshi format
         exchange.set_orderbook("TEST-TICKER", {
-            "yes": [[30, 100], [35, 200], [40, 150]],
-            "no": [[55, 100], [60, 200], [65, 150]],
+            "yes": [[35, 100], [38, 200], [40, 150]],  # YES bids
+            "no": [[55, 100], [57, 200], [59, 150]],   # NO bids
         })
 
         book = orderbook_manager.get("TEST-TICKER")
         assert book is not None
-        assert len(book.yes_asks) > 0
+        assert len(book.yes_bids) > 0
 
     @pytest.mark.asyncio
     async def test_orderbook_receives_delta(self, exchange, connector, orderbook_manager):
@@ -77,28 +78,28 @@ class TestIntegration:
 
         # Send snapshot first
         exchange.set_orderbook("TEST-TICKER", {
-            "yes": [[30, 100], [35, 200], [40, 150]],
-            "no": [[55, 100], [60, 200], [65, 150]],
+            "yes": [[35, 100], [38, 200], [40, 150]],  # YES bids
+            "no": [[55, 100], [57, 200], [59, 150]],   # NO bids
         })
 
         book = orderbook_manager.get("TEST-TICKER")
-        initial_size = book.yes_asks.get(35, 0)
+        initial_size = book.yes_bids.get(38, 0)
 
         # Send delta
-        exchange.update_orderbook("TEST-TICKER", "yes", 35, -50)
+        exchange.update_orderbook("TEST-TICKER", "yes", 38, -50)
 
         # Check size updated
-        assert book.yes_asks.get(35, 0) == initial_size - 50
+        assert book.yes_bids.get(38, 0) == initial_size - 50
 
     @pytest.mark.asyncio
     async def test_full_quote_cycle(self, exchange, connector, orderbook_manager, strategy, execution):
         """Test full cycle: market data -> strategy -> execution."""
         connector.on_message(orderbook_manager.handle_message)
 
-        # Send snapshot
+        # Send snapshot (yes/no are BID orders)
         exchange.set_orderbook("TEST-TICKER", {
-            "yes": [[30, 100], [35, 200], [40, 150]],
-            "no": [[55, 100], [60, 200], [65, 150]],
+            "yes": [[35, 100], [38, 200], [40, 150]],  # YES bids
+            "no": [[55, 100], [57, 200], [59, 150]],   # NO bids
         })
 
         # Get market state
@@ -131,10 +132,10 @@ class TestIntegration:
         """Test quotes are amended when price moves."""
         connector.on_message(orderbook_manager.handle_message)
 
-        # Send initial snapshot
+        # Send initial snapshot (yes/no are BID orders)
         exchange.set_orderbook("TEST-TICKER", {
-            "yes": [[30, 100], [35, 200], [40, 150]],
-            "no": [[55, 100], [60, 200], [65, 150]],
+            "yes": [[35, 100], [38, 200], [40, 150]],  # YES bids
+            "no": [[55, 100], [57, 200], [59, 150]],   # NO bids
         })
 
         # Initial quotes
@@ -222,10 +223,10 @@ class TestIntegration:
         """Test inventory skew affects quotes."""
         connector.on_message(orderbook_manager.handle_message)
 
-        # Send snapshot
+        # Send snapshot (yes/no are BID orders)
         exchange.set_orderbook("TEST-TICKER", {
-            "yes": [[30, 100], [35, 200], [40, 150]],
-            "no": [[55, 100], [60, 200], [65, 150]],
+            "yes": [[35, 100], [38, 200], [40, 150]],  # YES bids
+            "no": [[55, 100], [57, 200], [59, 150]],   # NO bids
         })
 
         book = orderbook_manager.get("TEST-TICKER")
@@ -319,10 +320,12 @@ class TestV2Integration:
         """Test that effective depth pricing ignores dust in thin books."""
         connector.on_message(orderbook_manager.handle_message)
 
-        # Set up a thin book with dust at top
+        # Set up a thin book with dust at best prices
+        # YES bids: dust at 35/33, real liquidity at 30/25
+        # NO bids: dust at 60/58, real liquidity at 55/50
         exchange.set_orderbook("TEST-TICKER", {
-            "yes": [[30, 5], [35, 10], [40, 100], [45, 200]],  # Dust at 30, 35
-            "no": [[55, 5], [60, 10], [65, 100], [70, 200]],   # Dust at 55, 60
+            "yes": [[35, 5], [33, 10], [30, 100], [25, 200]],   # YES bids - best=35 (dust)
+            "no": [[60, 5], [58, 10], [55, 100], [50, 200]],    # NO bids → YES asks at 40,42,45,50
         })
 
         book = orderbook_manager.get("TEST-TICKER")
@@ -331,11 +334,11 @@ class TestV2Integration:
         # Get effective quote with min_depth=100
         eff_bid, eff_ask = book.get_effective_quote(min_depth=100)
 
-        # Should skip the dust and use the real liquidity levels
-        # YES bids derived from NO asks: 65 -> YES bid at 35, 70 -> YES bid at 30
-        # But our dust is at those levels too
-        # Effective ask should be at 40 (100 contracts of YES asks)
-        assert eff_ask == 40
+        # YES bids walk: 35(5) + 33(10) + 30(100) = 115 ≥ 100 at price 30
+        assert eff_bid == 30
+
+        # YES asks (from NO bids at 100-price): 40(5) + 42(10) + 45(100) = 115 ≥ 100 at price 45
+        assert eff_ask == 45
 
     @pytest.mark.asyncio
     async def test_impulse_hard_limit_fires(self, impulse_engine):
