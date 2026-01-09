@@ -322,7 +322,12 @@ class TestV2Integration:
 
     @pytest.mark.asyncio
     async def test_effective_depth_pricing(self, exchange, connector, orderbook_manager):
-        """Test that effective depth pricing ignores dust in thin books."""
+        """Test that effective depth pricing respects BBO even with dust at top levels.
+
+        The effective quote walks depth to find where min_depth contracts exist,
+        but the result is always clamped to BBO to prevent generating quotes that
+        would cross the actual market spread.
+        """
         connector.on_message(orderbook_manager.handle_message)
 
         # Set up a thin book with dust at best prices
@@ -339,11 +344,11 @@ class TestV2Integration:
         # Get effective quote with min_depth=100
         eff_bid, eff_ask = book.get_effective_quote(min_depth=100)
 
-        # YES bids walk: 35(5) + 33(10) + 30(100) = 115 ≥ 100 at price 30
-        assert eff_bid == 30
-
-        # YES asks (from NO bids at 100-price): 40(5) + 42(10) + 45(100) = 115 ≥ 100 at price 45
-        assert eff_ask == 45
+        # Depth walk finds liquidity at 30 and 45, but we clamp to BBO:
+        # - best_bid = 35, best_ask = 40
+        # This ensures we never quote worse than the actual market
+        assert eff_bid == 35  # clamped to best_bid
+        assert eff_ask == 40  # clamped to best_ask
 
     @pytest.mark.asyncio
     async def test_impulse_hard_limit_fires(self, impulse_engine):

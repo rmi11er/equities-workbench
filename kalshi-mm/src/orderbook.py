@@ -236,48 +236,48 @@ class OrderBook:
         For deep books: Walks through until cumulative volume >= min_depth,
         finding the price level where real liquidity exists (ignoring dust).
 
-        For thin books: Falls back to actual BBO. We never want the effective
-        quote to be "better" than the actual market - that would cause us to
-        generate quotes that cross the spread. Thin books should make us quote
-        WIDER (via spread multipliers), not at incorrect prices.
+        IMPORTANT: The effective quote is used to calculate our mid price for
+        quoting. We should NEVER return prices that would cause our quotes to
+        cross the actual BBO. Therefore:
+        - effective_bid is always >= best_bid (we use BBO as the floor)
+        - effective_ask is always <= best_ask (we use BBO as the ceiling)
+
+        The effective quote represents where we believe "fair" value is based
+        on liquidity depth, but clamped to the actual market.
 
         Args:
             min_depth: Minimum contracts required to define "real" price
 
         Returns:
-            (effective_bid, effective_ask) tuple.
+            (effective_bid, effective_ask) tuple, always respecting actual BBO.
         """
-        # Get actual BBO first - we'll never return prices better than these
+        # Get actual BBO first - these are our bounds
         best_bid = self.best_yes_bid()
         best_ask = self.best_yes_ask()
 
-        # Walk bids (descending price) until we hit min_depth
-        effective_bid = 1  # Fallback
+        # Default to BBO (or fallback if no book)
+        effective_bid = best_bid if best_bid is not None else 1
+        effective_ask = best_ask if best_ask is not None else 99
+
+        # Walk bids (descending price) to find depth-weighted price
         cumulative_bid = 0
         for price in sorted(self.yes_bids.keys(), reverse=True):
             cumulative_bid += self.yes_bids[price]
-            effective_bid = price
             if cumulative_bid >= min_depth:
+                # Found sufficient depth at this price
+                # But never go below best_bid
+                effective_bid = max(price, best_bid) if best_bid else price
                 break
 
-        # If thin book, use actual best bid (not worst!)
-        # We use BBO as floor - effective bid should never exceed actual best bid
-        if cumulative_bid < min_depth:
-            effective_bid = best_bid if best_bid is not None else 1
-
-        # Walk asks (ascending price) until we hit min_depth
-        effective_ask = 99  # Fallback
+        # Walk asks (ascending price) to find depth-weighted price
         cumulative_ask = 0
         for price in sorted(self.yes_asks.keys()):
             cumulative_ask += self.yes_asks[price]
-            effective_ask = price
             if cumulative_ask >= min_depth:
+                # Found sufficient depth at this price
+                # But never go above best_ask
+                effective_ask = min(price, best_ask) if best_ask else price
                 break
-
-        # If thin book, use actual best ask (not worst!)
-        # We use BBO as ceiling - effective ask should never be below actual best ask
-        if cumulative_ask < min_depth:
-            effective_ask = best_ask if best_ask is not None else 99
 
         return effective_bid, effective_ask
 

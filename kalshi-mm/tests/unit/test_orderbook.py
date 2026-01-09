@@ -294,15 +294,16 @@ class TestEffectiveQuote:
         assert eff_ask == 99
 
     def test_thin_book_ignores_dust(self, thin_book):
-        """Test that thin book effective prices look past dust."""
-        # With min_depth=100, should skip the 5 and 10 contract levels
+        """Test that thin book uses BBO - we never quote worse than best prices."""
+        # With min_depth=100, even if depth is found at worse prices,
+        # we clamp to best_bid/best_ask to avoid crossing the spread
         eff_bid, eff_ask = thin_book.get_effective_quote(min_depth=100)
 
-        # Effective bid should be at 30 (100 contracts), not 35 (5 contracts)
-        assert eff_bid == 30
+        # Effective bid should be at best_bid (35), never worse
+        assert eff_bid == 35
 
-        # Effective ask should be at 45 (100 contracts), not 40 (5 contracts)
-        assert eff_ask == 45
+        # Effective ask should be at best_ask (40), never worse
+        assert eff_ask == 40
 
     def test_deep_book_uses_best_price(self, deep_book):
         """Test that deep book uses best prices when liquidity is sufficient."""
@@ -316,18 +317,20 @@ class TestEffectiveQuote:
         """Test effective mid price calculation."""
         eff_mid = thin_book.get_effective_mid(min_depth=100)
 
-        # (30 + 45) / 2 = 37.5
+        # With BBO clamping: effective_bid=35, effective_ask=40
+        # (35 + 40) / 2 = 37.5
         assert eff_mid == 37.5
 
     def test_effective_spread_calculation(self, thin_book):
         """Test effective spread calculation."""
         eff_spread = thin_book.get_effective_spread(min_depth=100)
 
-        # 45 - 30 = 15
-        assert eff_spread == 15.0
+        # With BBO clamping: effective_bid=35, effective_ask=40
+        # Spread = 40 - 35 = 5
+        assert eff_spread == 5.0
 
     def test_cumulative_depth_across_levels(self):
-        """Test that depth is accumulated across multiple levels."""
+        """Test that depth is accumulated across multiple levels but clamped to BBO."""
         book = OrderBook(ticker="TEST")
         book.yes_asks = {
             40: 30,   # 30 contracts at 40
@@ -342,16 +345,14 @@ class TestEffectiveQuote:
             25: 30,
         }
 
-        # With min_depth=100, should need to go through multiple levels
+        # With min_depth=100, depth is found at worse prices but clamped to BBO
         eff_bid, eff_ask = book.get_effective_quote(min_depth=100)
 
-        # Ask: 40 (30) + 42 (30) + 45 (30) + 50 (30) = 120 at 50
-        # Cumulative: 40->30, 42->60, 45->90, 50->120 >= 100
-        assert eff_ask == 50
+        # Ask: Depth found at 50 but clamped to best_ask=40
+        assert eff_ask == 40
 
-        # Bid: 35 (30) + 33 (30) + 30 (30) + 25 (30) = 120 at 25
-        # Cumulative: 35->30, 33->60, 30->90, 25->120 >= 100
-        assert eff_bid == 25
+        # Bid: Depth found at 25 but clamped to best_bid=35
+        assert eff_bid == 35
 
     def test_book_with_insufficient_total_depth(self):
         """Test book with less total depth than min_depth."""
