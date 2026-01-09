@@ -270,10 +270,13 @@ class TestExecution:
     @pytest.mark.asyncio
     async def test_execute_create(self, engine, mock_connector):
         """Test executing a create diff."""
+        # Set market state for validation (bid=45, ask=52)
+        engine.set_market_state("TEST", best_bid=45, best_ask=52)
+
         bid_diff = OrderDiff(
             action=OrderAction.CREATE,
             side=OrderSide.BUY,
-            price=48,
+            price=48,  # Below ask, won't cross
             size=10,
         )
         ask_diff = OrderDiff(action=OrderAction.NONE)

@@ -106,6 +106,11 @@ class TestIntegration:
         book = orderbook_manager.get("TEST-TICKER")
         mid = book.mid_price()
         volatility = orderbook_manager.get_volatility("TEST-TICKER")
+        best_bid = book.best_yes_bid()
+        best_ask = book.best_yes_ask()
+
+        # Set market state for validation (required for guardrails)
+        execution.set_market_state("TEST-TICKER", best_bid=best_bid, best_ask=best_ask)
 
         # Generate quotes
         quotes = strategy.generate_quotes(

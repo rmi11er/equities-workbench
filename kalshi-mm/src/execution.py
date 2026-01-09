@@ -56,6 +56,7 @@ class ExecutionEngine:
     - Compute minimal actions to reach target state
     - Debounce rapid quote updates
     - Execute orders via connector
+    - VALIDATE orders before submission (guardrails)
     """
 
     def __init__(
@@ -81,6 +82,74 @@ class ExecutionEngine:
         # API error tracking for circuit breaker
         self._consecutive_api_errors: int = 0
         self._total_api_errors: int = 0
+
+        # Market state for validation (set by market_maker before updates)
+        self._best_bid: dict[str, int] = {}
+        self._best_ask: dict[str, int] = {}
+
+    # -------------------------------------------------------------------------
+    # Guardrails / Validation
+    # -------------------------------------------------------------------------
+
+    def set_market_state(self, ticker: str, best_bid: int, best_ask: int) -> None:
+        """
+        Update market state for order validation.
+        Must be called before update_quotes.
+        """
+        self._best_bid[ticker] = best_bid
+        self._best_ask[ticker] = best_ask
+
+    def validate_order(
+        self,
+        ticker: str,
+        side: str,  # "yes" or "no"
+        price: int,
+        action: str = "create",
+    ) -> tuple[bool, str]:
+        """
+        Validate an order BEFORE submission.
+
+        Returns:
+            (is_valid, error_message)
+        """
+        # Basic price bounds
+        if price < 1 or price > 99:
+            return False, f"Price {price} out of bounds [1-99]"
+
+        # Get market state
+        market_bid = self._best_bid.get(ticker)
+        market_ask = self._best_ask.get(ticker)
+
+        if market_bid is None or market_ask is None:
+            return False, "No market state available for validation"
+
+        # Check for spread crossing
+        # YES buy order at price >= market_ask would take liquidity
+        # NO buy order at price >= (100 - market_bid) would take liquidity
+        if side == "yes":
+            if price >= market_ask:
+                return False, f"BID {price} would cross spread (ask={market_ask})"
+        else:  # side == "no"
+            no_crossing_threshold = 100 - market_bid
+            if price >= no_crossing_threshold:
+                # NO buy at this price = YES sell at (100-price) which is <= market_bid
+                yes_equiv = 100 - price
+                return False, f"ASK {yes_equiv} would cross spread (bid={market_bid})"
+
+        return True, ""
+
+    def validate_quote_pair(
+        self,
+        bid_price: Optional[int],
+        ask_price: Optional[int],
+    ) -> tuple[bool, str]:
+        """
+        Validate that bid/ask don't cross each other.
+        """
+        if bid_price is not None and ask_price is not None:
+            if bid_price >= ask_price:
+                return False, f"Quotes crossed: bid={bid_price} >= ask={ask_price}"
+        return True, ""
 
     def record_api_success(self) -> None:
         """Record successful API call - resets consecutive error counter."""
@@ -255,10 +324,16 @@ class ExecutionEngine:
         ]:
             if diff.action == OrderAction.AMEND and diff.order_id:
                 try:
+                    # CRITICAL: Convert YES ask price to NO buy price
+                    api_price = diff.price
+                    if side_str == "no" and diff.price is not None:
+                        api_price = 100 - diff.price
+                        logger.debug(f"Converting amend ask: YES@{diff.price} -> NO@{api_price}")
+
                     resp = await self.connector.amend_order(
                         order_id=diff.order_id,
                         side=side_str,
-                        price=diff.price,
+                        price=api_price,
                         count=diff.size,
                     )
                     # Update our state
@@ -287,10 +362,27 @@ class ExecutionEngine:
         ]:
             if diff.action == OrderAction.CREATE:
                 try:
+                    # CRITICAL: Convert YES ask price to NO buy price
+                    # Selling YES at X = Buying NO at (100-X)
+                    api_price = diff.price
+                    if side_str == "no":
+                        api_price = 100 - diff.price
+                        logger.debug(f"Converting ask: YES@{diff.price} -> NO@{api_price}")
+
+                    # GUARDRAIL: Validate order before submission
+                    is_valid, error_msg = self.validate_order(
+                        ticker=ticker,
+                        side=side_str,
+                        price=api_price,
+                    )
+                    if not is_valid:
+                        logger.error(f"ORDER BLOCKED: {error_msg} (would be {side_str}@{api_price})")
+                        continue  # Skip this order
+
                     resp = await self.connector.create_order(
                         ticker=ticker,
                         side=side_str,
-                        price=diff.price,
+                        price=api_price,
                         count=diff.size,
                     )
 

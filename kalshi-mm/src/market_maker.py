@@ -543,8 +543,24 @@ class MarketMaker:
                 lip_adjusted = True
         latency_tracker.record_lip_adjustment(t.elapsed_us)
 
+        # GUARDRAIL: Validate quote pair before execution
+        is_valid, error_msg = self.execution.validate_quote_pair(
+            quotes.bid_price if should_bid else None,
+            quotes.ask_price if should_ask else None,
+        )
+        if not is_valid:
+            logger.error(f"QUOTE PAIR BLOCKED: {error_msg}")
+            self.decision_logger.log_error(
+                "crossed_quotes_blocked",
+                {"bid": quotes.bid_price, "ask": quotes.ask_price, "error": error_msg}
+            )
+            return
+
         # 4. EXECUTE with latency tracking
         with LatencyTimer() as t:
+            # CRITICAL: Set market state for order validation
+            self.execution.set_market_state(self.ticker, best_bid, best_ask)
+
             await self.execution.update_quotes(
                 ticker=self.ticker,
                 target=quotes,
