@@ -374,3 +374,350 @@ class TestEffectiveQuote:
         # This ensures we never generate quotes that cross the actual market
         assert eff_bid == 35  # Best (highest) bid
         assert eff_ask == 40  # Best (lowest) ask
+
+
+class TestDepthLevels:
+    """Test get_depth_levels() - unclamped depth price discovery."""
+
+    def test_liquid_bbo_returns_bbo(self):
+        """When BBO has sufficient depth, depth_bid/ask equals BBO."""
+        book = OrderBook(ticker="TEST")
+        book.yes_bids = {36: 40000}  # 40k contracts at 36
+        book.yes_asks = {37: 40000}  # 40k contracts at 37
+
+        depth_bid, depth_ask = book.get_depth_levels(min_depth=300)
+
+        assert depth_bid == 36  # Depth found at BBO
+        assert depth_ask == 37  # Depth found at BBO
+
+    def test_thin_bbo_returns_deeper_levels(self):
+        """When BBO has dust, return where real depth exists."""
+        book = OrderBook(ticker="TEST")
+        book.yes_bids = {
+            36: 50,    # Dust at BBO
+            35: 50,    # More dust
+            34: 500,   # Real depth here
+        }
+        book.yes_asks = {
+            37: 50,    # Dust at BBO
+            38: 50,    # More dust
+            39: 500,   # Real depth here
+        }
+
+        depth_bid, depth_ask = book.get_depth_levels(min_depth=300)
+
+        assert depth_bid == 34  # Had to go deeper to find 300
+        assert depth_ask == 39  # Had to go deeper to find 300
+
+    def test_cumulative_depth_accumulates(self):
+        """Depth accumulates across levels until threshold met."""
+        book = OrderBook(ticker="TEST")
+        book.yes_bids = {
+            36: 100,   # 100 at 36
+            35: 100,   # +100 = 200 at 35
+            34: 100,   # +100 = 300 at 34 (threshold met)
+            33: 500,
+        }
+        book.yes_asks = {
+            37: 150,   # 150 at 37
+            38: 150,   # +150 = 300 at 38 (threshold met)
+            39: 500,
+        }
+
+        depth_bid, depth_ask = book.get_depth_levels(min_depth=300)
+
+        assert depth_bid == 34  # Cumulative 300 reached at 34
+        assert depth_ask == 38  # Cumulative 300 reached at 38
+
+
+class TestQuoteClamping:
+    """
+    Test the quote clamping logic for depth-based spread adjustment.
+
+    The rules are:
+    1. LIQUID BBO (depth at BBO >= min_depth): Quote AT the BBO
+       - bid = max(strategy_bid, best_bid) - push UP to BBO
+       - ask = min(strategy_ask, best_ask) - push DOWN to BBO
+
+    2. THIN BBO (depth at BBO < min_depth): Quote at depth levels
+       - bid = min(strategy_bid, depth_bid) - push DOWN to depth
+       - ask = max(strategy_ask, depth_ask) - push UP to depth
+    """
+
+    @pytest.fixture
+    def liquid_book(self):
+        """Book with 40k contracts at BBO - very liquid."""
+        book = OrderBook(ticker="TEST")
+        book.yes_bids = {36: 40000}
+        book.yes_asks = {37: 40000}
+        return book
+
+    @pytest.fixture
+    def thin_book_with_depth(self):
+        """Book with dust at BBO, real liquidity deeper."""
+        book = OrderBook(ticker="TEST")
+        book.yes_bids = {
+            36: 50,    # Dust at BBO
+            34: 500,   # Real depth
+        }
+        book.yes_asks = {
+            37: 50,    # Dust at BBO
+            39: 500,   # Real depth
+        }
+        return book
+
+    @pytest.fixture
+    def penny_wide_liquid(self):
+        """Penny-wide market with good liquidity."""
+        book = OrderBook(ticker="TEST")
+        book.yes_bids = {45: 1000}
+        book.yes_asks = {46: 1000}
+        return book
+
+    @pytest.fixture
+    def wide_liquid(self):
+        """Wide market (3 cents) with good liquidity."""
+        book = OrderBook(ticker="TEST")
+        book.yes_bids = {45: 1000}
+        book.yes_asks = {48: 1000}
+        return book
+
+    # =========================================================================
+    # LIQUID MARKET TESTS - Should quote AT BBO
+    # =========================================================================
+
+    def test_liquid_market_strategy_too_wide_tightens_to_bbo(self, liquid_book):
+        """
+        When market is liquid and strategy wants to quote wider than BBO,
+        we should tighten to BBO.
+
+        Market: 36 bid (40k) / 37 ask (40k)
+        Strategy wants: 35 bid / 38 ask (too wide)
+        Result: 36 bid / 37 ask (tightened to BBO)
+        """
+        clamped_bid, clamped_ask = liquid_book.clamp_quotes_to_depth(
+            strategy_bid=35,
+            strategy_ask=38,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 36, "Should tighten bid UP to BBO in liquid market"
+        assert clamped_ask == 37, "Should tighten ask DOWN to BBO in liquid market"
+
+    def test_liquid_market_strategy_at_bbo_stays_at_bbo(self, liquid_book):
+        """
+        When market is liquid and strategy already at BBO, stay there.
+
+        Market: 36 bid (40k) / 37 ask (40k)
+        Strategy wants: 36 bid / 37 ask
+        Result: 36 bid / 37 ask (unchanged)
+        """
+        clamped_bid, clamped_ask = liquid_book.clamp_quotes_to_depth(
+            strategy_bid=36,
+            strategy_ask=37,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 36
+        assert clamped_ask == 37
+
+    def test_liquid_penny_wide_quotes_penny_wide(self, penny_wide_liquid):
+        """
+        Penny-wide liquid market should result in penny-wide quotes.
+
+        Market: 45 bid (1k) / 46 ask (1k)
+        Strategy wants: 44 bid / 47 ask (too wide)
+        Result: 45 bid / 46 ask (penny-wide at BBO)
+        """
+        clamped_bid, clamped_ask = penny_wide_liquid.clamp_quotes_to_depth(
+            strategy_bid=44,
+            strategy_ask=47,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 45, "Should be at BBO bid"
+        assert clamped_ask == 46, "Should be at BBO ask"
+        assert clamped_ask - clamped_bid == 1, "Should be penny-wide"
+
+    def test_liquid_wide_market_matches_market_spread(self, wide_liquid):
+        """
+        Wide but liquid market - match the market spread.
+
+        Market: 45 bid (1k) / 48 ask (1k) - 3 cent spread
+        Strategy wants: 44 bid / 49 ask (too wide)
+        Result: 45 bid / 48 ask (match market)
+        """
+        clamped_bid, clamped_ask = wide_liquid.clamp_quotes_to_depth(
+            strategy_bid=44,
+            strategy_ask=49,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 45
+        assert clamped_ask == 48
+        assert clamped_ask - clamped_bid == 3, "Should match market spread"
+
+    # =========================================================================
+    # THIN MARKET TESTS - Should quote at depth levels (wider)
+    # =========================================================================
+
+    def test_thin_market_widens_to_depth_levels(self, thin_book_with_depth):
+        """
+        When market has dust at BBO, widen to where real depth exists.
+
+        Market: 36 bid (50) / 37 ask (50) - dust
+                34 bid (500) / 39 ask (500) - real depth
+        Strategy wants: 35 bid / 38 ask
+        Result: 34 bid / 39 ask (widened to depth)
+        """
+        clamped_bid, clamped_ask = thin_book_with_depth.clamp_quotes_to_depth(
+            strategy_bid=35,
+            strategy_ask=38,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 34, "Should widen bid DOWN to depth level"
+        assert clamped_ask == 39, "Should widen ask UP to depth level"
+
+    def test_thin_market_strategy_already_at_depth_stays(self, thin_book_with_depth):
+        """
+        When strategy already at depth levels, stay there.
+
+        Market: dust at 36/37, depth at 34/39
+        Strategy wants: 34 bid / 39 ask (already at depth)
+        Result: 34 bid / 39 ask (unchanged)
+        """
+        clamped_bid, clamped_ask = thin_book_with_depth.clamp_quotes_to_depth(
+            strategy_bid=34,
+            strategy_ask=39,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 34
+        assert clamped_ask == 39
+
+    def test_thin_market_strategy_wider_than_depth_uses_strategy(self, thin_book_with_depth):
+        """
+        When strategy wants to quote wider than depth, allow it.
+
+        Market: dust at 36/37, depth at 34/39
+        Strategy wants: 33 bid / 40 ask (wider than depth)
+        Result: 33 bid / 40 ask (strategy wins, it's more conservative)
+        """
+        clamped_bid, clamped_ask = thin_book_with_depth.clamp_quotes_to_depth(
+            strategy_bid=33,
+            strategy_ask=40,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 33, "Strategy can quote wider than depth"
+        assert clamped_ask == 40, "Strategy can quote wider than depth"
+
+    # =========================================================================
+    # EDGE CASES
+    # =========================================================================
+
+    def test_empty_book_returns_fallback(self):
+        """Empty book should return wide fallback quotes."""
+        book = OrderBook(ticker="TEST")
+
+        clamped_bid, clamped_ask = book.clamp_quotes_to_depth(
+            strategy_bid=50,
+            strategy_ask=50,
+            min_depth=300,
+        )
+
+        # Should return safe fallback
+        assert clamped_bid == 1
+        assert clamped_ask == 99
+
+    def test_one_sided_book_bid_only(self):
+        """Book with only bids should handle gracefully."""
+        book = OrderBook(ticker="TEST")
+        book.yes_bids = {36: 1000}
+
+        clamped_bid, clamped_ask = book.clamp_quotes_to_depth(
+            strategy_bid=35,
+            strategy_ask=40,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 36  # Liquid bid side, tighten to BBO
+        assert clamped_ask == 99  # No asks, fallback
+
+    def test_one_sided_book_ask_only(self):
+        """Book with only asks should handle gracefully."""
+        book = OrderBook(ticker="TEST")
+        book.yes_asks = {37: 1000}
+
+        clamped_bid, clamped_ask = book.clamp_quotes_to_depth(
+            strategy_bid=35,
+            strategy_ask=40,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 1   # No bids, fallback
+        assert clamped_ask == 37  # Liquid ask side, tighten to BBO
+
+    def test_prevents_crossed_quotes(self):
+        """Should never return crossed quotes."""
+        book = OrderBook(ticker="TEST")
+        book.yes_bids = {50: 1000}
+        book.yes_asks = {45: 1000}  # Crossed book (unusual)
+
+        clamped_bid, clamped_ask = book.clamp_quotes_to_depth(
+            strategy_bid=48,
+            strategy_ask=47,
+            min_depth=300,
+        )
+
+        # Should ensure bid < ask
+        assert clamped_bid < clamped_ask, "Quotes must not cross"
+
+    def test_seattle_nfc_scenario(self):
+        """
+        Real scenario: Seattle NFC Championship.
+        BBO: 36 bid with 40k contracts / 37 ask with 40k contracts
+        We should quote 36/37, NOT 35/38.
+        """
+        book = OrderBook(ticker="KXNFLNFCCHAMP-25-SEA")
+        book.yes_bids = {36: 40000}
+        book.yes_asks = {37: 40000}
+
+        # Strategy (Stoikov) wants to quote wider due to volatility
+        clamped_bid, clamped_ask = book.clamp_quotes_to_depth(
+            strategy_bid=35,
+            strategy_ask=38,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 36, "Must bid at BBO when liquid"
+        assert clamped_ask == 37, "Must ask at BBO when liquid"
+
+    def test_mvp_scenario_with_dust(self):
+        """
+        Real scenario: MVP market with dust at top.
+        BBO: 61 bid (50 contracts) / 62 ask (50 contracts) - dust
+        Real depth: 59 bid (500) / 64 ask (500)
+        We should quote 59/64 (wider), NOT 61/62.
+        """
+        book = OrderBook(ticker="KXNFLMVP-26-MSTA")
+        book.yes_bids = {
+            61: 50,   # Dust
+            60: 50,   # Dust
+            59: 500,  # Real depth
+        }
+        book.yes_asks = {
+            62: 50,   # Dust
+            63: 50,   # Dust
+            64: 500,  # Real depth
+        }
+
+        clamped_bid, clamped_ask = book.clamp_quotes_to_depth(
+            strategy_bid=60,
+            strategy_ask=63,
+            min_depth=300,
+        )
+
+        assert clamped_bid == 59, "Should widen to depth level"
+        assert clamped_ask == 64, "Should widen to depth level"

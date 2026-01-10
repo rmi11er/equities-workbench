@@ -52,7 +52,8 @@ class TestIntegration:
 
     @pytest.fixture
     def execution(self, connector):
-        config = StrategyConfig()
+        # Disable min_join_depth for tests (otherwise quotes at prices without depth are skipped)
+        config = StrategyConfig(min_join_depth=0)
         return ExecutionEngine(config, connector)
 
     @pytest.mark.asyncio
@@ -110,7 +111,10 @@ class TestIntegration:
         best_ask = book.best_yes_ask()
 
         # Set market state for validation (required for guardrails)
-        execution.set_market_state("TEST-TICKER", best_bid=best_bid, best_ask=best_ask)
+        # Include book depth so we pass min_join_depth check
+        # Combine yes_bids and yes_asks for depth checking
+        book_depth = {**book.yes_bids, **book.yes_asks} if book else {}
+        execution.set_market_state("TEST-TICKER", best_bid=best_bid, best_ask=best_ask, book_depth=book_depth)
 
         # Generate quotes
         quotes = strategy.generate_quotes(

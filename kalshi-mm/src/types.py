@@ -55,6 +55,7 @@ class Order:
     remaining: int
     filled: int
     status: OrderStatus
+    client_order_id: Optional[str] = None  # For Kalshi amend API
     created_at: datetime = field(default_factory=datetime.now)
 
     @property

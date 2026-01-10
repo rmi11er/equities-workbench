@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from contextlib import asynccontextmanager
@@ -189,6 +190,17 @@ class KalshiConnector:
             path += f"?ticker={ticker}"
         return await self._request("GET", path)
 
+    async def get_queue_position(self, order_id: str) -> int:
+        """
+        Get an order's queue position in the order book.
+
+        Returns:
+            Number of contracts ahead in the queue that need to fill
+            before this order receives a match. Lower = better priority.
+        """
+        resp = await self._request("GET", f"/portfolio/orders/{order_id}/queue_position")
+        return resp.get("queue_position", 0)
+
     async def create_order(
         self,
         ticker: str,
@@ -202,20 +214,25 @@ class KalshiConnector:
 
         Args:
             ticker: Market ticker
-            side: "buy" or "sell"
+            side: "yes" or "no"
             price: Price in cents (1-99)
             count: Number of contracts
-            client_order_id: Optional client-side order ID
+            client_order_id: Optional client-side order ID (auto-generated if not provided)
 
         Returns:
-            Order response with order_id
+            Order response with order_id and client_order_id
         """
+        # Always generate client_order_id for amend support
+        if client_order_id is None:
+            client_order_id = str(uuid.uuid4())
+
         data = {
             "ticker": ticker,
             "side": side,
             "type": "limit",
             "action": "buy",  # Always buy yes/no contracts
             "count": count,
+            "client_order_id": client_order_id,
             "yes_price": price if side == "yes" else None,
             "no_price": price if side == "no" else None,
         }
@@ -223,15 +240,22 @@ class KalshiConnector:
         # Remove None values
         data = {k: v for k, v in data.items() if v is not None}
 
-        if client_order_id:
-            data["client_order_id"] = client_order_id
+        resp = await self._request("POST", "/portfolio/orders", data, is_write=True)
 
-        return await self._request("POST", "/portfolio/orders", data, is_write=True)
+        # Ensure client_order_id is in response for tracking
+        if "order" in resp:
+            resp["order"]["client_order_id"] = client_order_id
+        else:
+            resp["client_order_id"] = client_order_id
+
+        return resp
 
     async def amend_order(
         self,
         order_id: str,
+        ticker: str,
         side: str,
+        client_order_id: str,
         price: Optional[int] = None,
         count: Optional[int] = None,
     ) -> dict:
@@ -239,30 +263,60 @@ class KalshiConnector:
         Amend an existing order.
 
         Args:
-            order_id: The order to amend
+            order_id: The order to amend (in URL path)
+            ticker: Market ticker (required by Kalshi API)
             side: "yes" or "no" - required for price field naming
-            price: New price (optional)
+            client_order_id: Original client order ID (required by Kalshi API)
+            price: New price (required - exactly one of yes_price/no_price)
             count: New max fillable count (optional)
 
         Returns:
             Amended order response
         """
-        data = {}
-        if price is not None:
-            # Kalshi requires yes_price or no_price, NOT just "price"
-            if side == "yes":
-                data["yes_price"] = price
-            else:
-                data["no_price"] = price
+        # Validate required fields
+        if not ticker or not side:
+            raise ValueError(f"Amend missing required fields: ticker={ticker}, side={side}")
+        if not client_order_id:
+            raise ValueError(f"Amend missing client_order_id: order_id={order_id}")
+        if price is None:
+            raise ValueError(f"Amend missing price: order_id={order_id}, ticker={ticker}")
+
+        # Generate new client_order_id for the amended order
+        updated_client_order_id = str(uuid.uuid4())
+
+        # Build request body with all required fields per Kalshi API docs
+        data = {
+            "ticker": ticker,
+            "side": side,
+            "action": "buy",  # We always "buy" yes/no contracts
+            "client_order_id": client_order_id,
+            "updated_client_order_id": updated_client_order_id,
+        }
+
+        # Add exactly one of yes_price or no_price
+        if side == "yes":
+            data["yes_price"] = price
+        else:
+            data["no_price"] = price
+
         if count is not None:
             data["count"] = count
 
-        return await self._request(
+        logger.info(
+            f"Amend: order={order_id[:8]}, {ticker}, {side}@{price}, count={count}, "
+            f"client_id={client_order_id[:8]}...->{ updated_client_order_id[:8]}..."
+        )
+
+        resp = await self._request(
             "POST",
             f"/portfolio/orders/{order_id}/amend",
             data,
             is_write=True,
         )
+
+        # Return the new client_order_id for tracking
+        resp["updated_client_order_id"] = updated_client_order_id
+        return resp
 
     async def cancel_order(self, order_id: str) -> dict:
         """Cancel an order."""

@@ -31,6 +31,7 @@ class TestStoikovStrategy:
             gamma=0.05,
             time_horizon=1.0,
             min_spread=2.0,
+            max_spread=0,
         )
 
         r = strategy.compute_reservation_price(params)
@@ -45,6 +46,7 @@ class TestStoikovStrategy:
             gamma=0.05,
             time_horizon=1.0,
             min_spread=2.0,
+            max_spread=0,
         )
 
         r = strategy.compute_reservation_price(params)
@@ -65,6 +67,7 @@ class TestStoikovStrategy:
             gamma=0.05,
             time_horizon=1.0,
             min_spread=2.0,
+            max_spread=0,
         )
 
         r = strategy.compute_reservation_price(params)

@@ -58,6 +58,7 @@ class StoikovParams:
     gamma: float          # γ - risk aversion
     time_horizon: float   # T-t - time remaining (dynamic, 0.1 to 1.0)
     min_spread: float     # minimum absolute spread floor (cents)
+    max_spread: float     # maximum spread ceiling (0 = no ceiling)
 
 
 class StoikovStrategy:
@@ -132,7 +133,13 @@ class StoikovStrategy:
         calculated_spread = inventory_risk_term + market_impact_term
 
         # Apply minimum absolute spread floor (safety net for illiquid markets)
-        return max(calculated_spread, params.min_spread)
+        spread = max(calculated_spread, params.min_spread)
+
+        # Apply maximum spread ceiling (for tight quoting in liquid markets)
+        if params.max_spread > 0:
+            spread = min(spread, params.max_spread)
+
+        return spread
 
     def generate_quotes(
         self,
@@ -170,6 +177,7 @@ class StoikovStrategy:
             gamma=self.config.risk_aversion,
             time_horizon=time_horizon,
             min_spread=self.config.min_absolute_spread,
+            max_spread=self.config.max_spread,
         )
 
         # Compute reservation price

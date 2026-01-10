@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
 from .config import Config
-from .connector import KalshiConnector, WSMessage
+from .connector import KalshiConnector, WSMessage, RateLimitError, APIError
 from .constants import STALE_DATA_THRESHOLD_SEC
 from .execution import ExecutionEngine
 from .logger import LogManager
@@ -33,6 +33,8 @@ from .decision_log import (
     QuoteDecision, ImpulseEvent, FillEvent,
     MarketState, PositionState, LatencyBreakdown,
 )
+from .fill_logger import FillLogger
+from .volatility_regime import VolatilityRegime, VolatilityRegimeConfig
 
 if TYPE_CHECKING:
     from .run_context import RunContext
@@ -88,21 +90,27 @@ class MultiMarketOrchestrator:
         for ticker in config.tickers:
             self._markets[ticker] = MarketContext(ticker=ticker)
 
-        # Determine decision log path
+        # Determine log paths
         if run_context and run_context.decisions_path:
             decisions_path = run_context.decisions_path
+            fills_path = run_context.decisions_path.replace("decisions.jsonl", "fills.jsonl")
         else:
             decisions_path = config.logging.ops_log_path.replace("ops.log", "decisions.jsonl")
+            fills_path = config.logging.ops_log_path.replace("ops.log", "fills.jsonl")
 
         # Shared components
         self.decision_logger = DecisionLogger(log_path=decisions_path)
+        self.volatility_regime = VolatilityRegime(VolatilityRegimeConfig())
         self.connector = KalshiConnector(config)
         self.orderbook_manager = OrderBookManager(config.volatility)
+        # FillLogger after orderbook_manager so it can look up correlated markets
+        self.fill_logger = FillLogger(log_path=fills_path, orderbook_manager=self.orderbook_manager)
         self.strategy = StoikovStrategy(config.strategy)
         self.execution = ExecutionEngine(
             config.strategy,
             self.connector,
             decision_logger=self.decision_logger,
+            volatility_regime=self.volatility_regime,
         )
         self.alpha_engine = AlphaEngine()
         self.log_manager = LogManager(config.logging, run_context=run_context)
@@ -140,6 +148,11 @@ class MultiMarketOrchestrator:
 
         # Start connector
         await self.connector.start()
+
+        # CRITICAL: Cancel any stale orders from previous runs
+        # This prevents stale orders from executing at bad prices
+        logger.info("Cancelling any stale orders from previous runs...")
+        await self._cancel_all_stale_orders()
 
         # Fetch market expiry timestamps for all markets
         await self._fetch_all_market_expiries()
@@ -198,6 +211,7 @@ class MultiMarketOrchestrator:
             logger.error(f"Error stopping connector: {e}")
 
         self.decision_logger.stop()
+        self.fill_logger.close()
         self.log_manager.stop()
 
         logger.info("Multi-market orchestrator stopped")
@@ -256,6 +270,23 @@ class MultiMarketOrchestrator:
             if ticker and ticker in self._markets:
                 self._markets[ticker].last_tick_time = time.monotonic()
 
+                # REACTIVE: Check if our quotes are now exposed after this orderbook update
+                book = self.orderbook_manager.get(ticker)
+                if book:
+                    best_bid = book.best_yes_bid()
+                    best_ask = book.best_yes_ask()
+                    # Build book_depth for depth monitoring
+                    book_depth = {}
+                    if book.yes_bids:
+                        book_depth.update(book.yes_bids)
+                    if book.yes_asks:
+                        book_depth.update(book.yes_asks)
+                    asyncio.create_task(
+                        self.execution.check_and_pull_exposed_quotes(
+                            ticker, best_bid, best_ask, book_depth
+                        )
+                    )
+
         elif msg.type == "fill":
             self._handle_fill(msg)
 
@@ -274,6 +305,73 @@ class MultiMarketOrchestrator:
         """Handle a fill notification."""
         fill_data = msg.msg
         logger.info(f"Fill received: {fill_data}")
+
+        # Parse fill data and update execution engine state
+        ticker = fill_data.get("market_ticker")
+        order_id = fill_data.get("order_id")
+        count = fill_data.get("count", 0)
+        yes_price = fill_data.get("yes_price", 50)
+        purchased_side = fill_data.get("purchased_side", "yes")
+
+        if not ticker or not order_id:
+            logger.warning(f"Fill missing required fields: {fill_data}")
+            return
+
+        # Determine side in our system:
+        # purchased_side="yes" -> we bought YES -> OrderSide.BUY
+        # purchased_side="no" -> we bought NO (sold YES) -> OrderSide.SELL
+        from .constants import OrderSide
+        side = OrderSide.BUY if purchased_side == "yes" else OrderSide.SELL
+
+        # Get current inventory for this market
+        ctx = self._markets.get(ticker)
+        inventory_before = ctx.position.net_position if ctx else 0
+
+        # Calculate inventory after
+        if purchased_side == "yes":
+            inventory_after = inventory_before + count
+        else:
+            inventory_after = inventory_before - count
+
+        # Log fill snapshot with orderbook state BEFORE updating execution state
+        orderbook = self.orderbook_manager.get(ticker)
+        quote_state = self.execution.get_quote_state(ticker)
+        self.fill_logger.log_fill(
+            ticker=ticker,
+            fill_data=fill_data,
+            orderbook=orderbook,
+            quote_state=quote_state,
+            inventory_before=inventory_before,
+            inventory_after=inventory_after,
+        )
+
+        # Update execution engine state
+        self.execution.handle_fill(
+            ticker=ticker,
+            order_id=order_id,
+            side=side,
+            price=yes_price,
+            size=count,
+            inventory_before=inventory_before,
+        )
+
+        # Update position
+        if ctx:
+            if purchased_side == "yes":
+                ctx.position.yes_contracts += count
+            else:
+                ctx.position.no_contracts += count
+            logger.info(f"Position updated: {ticker} -> {ctx.position.net_position}")
+
+        # Notify volatility regime of fill (may trigger high-vol state)
+        book = self.orderbook_manager.get(ticker)
+        spread = 0
+        if book:
+            best_bid = book.best_yes_bid()
+            best_ask = book.best_yes_ask()
+            if best_bid and best_ask:
+                spread = best_ask - best_bid
+        self.volatility_regime.update(ticker, spread=spread, had_fill=True)
 
     def _handle_reconnect(self) -> None:
         """Handle WebSocket reconnection."""
@@ -295,8 +393,9 @@ class MultiMarketOrchestrator:
 
         We add a small delay between markets to pace order creation and
         avoid exhausting the rate limit bucket on startup.
+
+        Tick interval is dynamic based on volatility regime - faster in high-vol.
         """
-        interval = 0.1  # 100ms between full cycles
         # Pace order creation: ~100ms between markets ensures we stay under 10 writes/sec
         # (2 orders per market = 20 orders/sec max if no delay)
         inter_market_delay = 0.12  # 120ms between markets
@@ -314,12 +413,20 @@ class MultiMarketOrchestrator:
                     logger.exception(f"Strategy tick error for {ctx.ticker}: {e}")
 
                 # Pace between markets to respect rate limits
-                await asyncio.sleep(inter_market_delay)
+                # Use faster pacing in high-vol mode
+                if self.volatility_regime.is_high_vol(ctx.ticker):
+                    await asyncio.sleep(inter_market_delay * 0.5)  # 60ms in high-vol
+                else:
+                    await asyncio.sleep(inter_market_delay)
+
+            # Get the fastest tick interval needed across all markets
+            min_interval = min(
+                self.volatility_regime.get_tick_interval(t) for t in self.tickers
+            )
 
             # Sleep for remainder of interval (if any)
             elapsed = time.monotonic() - tick_start
-            min_cycle_time = len(self._markets) * inter_market_delay
-            sleep_time = max(0, interval - elapsed)
+            sleep_time = max(0, min_interval - elapsed)
             await asyncio.sleep(sleep_time)
 
             self._tick_count += 1
@@ -346,6 +453,17 @@ class MultiMarketOrchestrator:
             adaptive = compute_adaptive_params(liq_metrics)
             best_bid = book.best_yes_bid()
             best_ask = book.best_yes_ask()
+
+            # Calculate spread and update volatility regime
+            spread = (best_ask - best_bid) if (best_bid and best_ask) else 0
+            self.volatility_regime.update(ticker, spread=spread, had_fill=False)
+
+            # Build book_depth dict for depth-based guardrails
+            book_depth = {}
+            if book.yes_bids:
+                book_depth.update(book.yes_bids)
+            if book.yes_asks:
+                book_depth.update(book.yes_asks)
         latency_tracker.record_orderbook_update(t.elapsed_us)
 
         # Effective pricing
@@ -483,6 +601,25 @@ class MultiMarketOrchestrator:
         # Store reservation price
         ctx.last_reservation_price = quotes.reservation_price
 
+        # Clamp quotes to depth levels
+        # - Liquid markets: tighten to BBO
+        # - Thin markets: widen to where real depth exists
+        clamped_bid, clamped_ask = book.clamp_quotes_to_depth(
+            strategy_bid=quotes.bid_price,
+            strategy_ask=quotes.ask_price,
+            min_depth=min_depth,
+        )
+
+        quotes = StrategyOutput(
+            bid_price=clamped_bid,
+            ask_price=clamped_ask,
+            bid_size=quotes.bid_size,
+            ask_size=quotes.ask_size,
+            reservation_price=quotes.reservation_price,
+            spread=float(clamped_ask - clamped_bid),
+            inventory_skew=quotes.inventory_skew,
+        )
+
         # Apply LIP constraints
         lip_adjusted = False
         lip_constraints = self.lip_manager.get_constraints(ticker)
@@ -503,7 +640,15 @@ class MultiMarketOrchestrator:
 
         # Execute
         with LatencyTimer() as t:
-            self.execution.set_market_state(ticker, best_bid, best_ask)
+            # Build book depth map for depth checking (combines bids and asks in YES terms)
+            book_depth = {}
+            if book:
+                # Combine YES bids and asks for depth info
+                if book.yes_bids:
+                    book_depth.update(book.yes_bids)
+                if book.yes_asks:
+                    book_depth.update(book.yes_asks)
+            self.execution.set_market_state(ticker, best_bid, best_ask, book_depth)
             await self.execution.update_quotes(
                 ticker=ticker,
                 target=quotes,
@@ -534,10 +679,18 @@ class MultiMarketOrchestrator:
 
         # Periodic logging (less frequent in multi-market mode)
         if self._tick_count % 50 == 0:
-            logger.info(
-                f"[{ticker}] mid={mid:.1f}, bid={quotes.bid_price}, ask={quotes.ask_price}, "
-                f"inv={inventory}, vol={volatility:.2f}"
-            )
+            # Log volatility regime status if in high-vol mode
+            regime_status = self.volatility_regime.get_status(ticker)
+            if regime_status.get("is_high_vol"):
+                logger.warning(
+                    f"[{ticker}] HIGH-VOL: depth_mult={regime_status.get('depth_multiplier', 1):.1f}x, "
+                    f"mid={mid:.1f}, bid={quotes.bid_price}, ask={quotes.ask_price}, inv={inventory}"
+                )
+            else:
+                logger.info(
+                    f"[{ticker}] mid={mid:.1f}, bid={quotes.bid_price}, ask={quotes.ask_price}, "
+                    f"inv={inventory}, vol={volatility:.2f}"
+                )
 
     def _apply_lip_constraints(
         self,
@@ -637,6 +790,79 @@ class MultiMarketOrchestrator:
             await self.execution.cancel_all(ctx.ticker)
         except Exception as e:
             logger.error(f"Failed to cancel orders for {ctx.ticker}: {e}")
+
+    async def _cancel_all_stale_orders(self) -> None:
+        """Cancel any stale orders from previous runs on all configured tickers.
+
+        This prevents stale orders left by crashed/killed previous runs from
+        executing at bad prices when the market moves.
+
+        Uses staggered timing and retry logic to avoid rate limit issues.
+        """
+        total_cancelled = 0
+        total_failed = 0
+        max_retries = 3
+        base_delay = 0.15  # 150ms between cancels
+        order_count = 0
+
+        for ticker in self.tickers:
+            try:
+                # Get all open orders for this ticker
+                orders_resp = await self.connector.get_orders(ticker)
+                resting_orders = [
+                    o for o in orders_resp.get("orders", [])
+                    if o.get("status") == "resting"
+                ]
+
+                if not resting_orders:
+                    continue
+
+                logger.warning(
+                    f"Found {len(resting_orders)} stale orders for {ticker} - cancelling"
+                )
+
+                for order in resting_orders:
+                    order_id = order.get("order_id")
+
+                    # Stagger requests to avoid rate limit
+                    if order_count > 0:
+                        await asyncio.sleep(base_delay)
+                    order_count += 1
+
+                    # Retry logic for transient failures
+                    for attempt in range(max_retries):
+                        try:
+                            await self.connector.cancel_order(order_id)
+                            total_cancelled += 1
+                            logger.info(f"Cancelled stale order {order_id}")
+                            break
+                        except RateLimitError:
+                            wait_time = 0.5 * (attempt + 1)
+                            logger.warning(f"Rate limited cancelling {order_id}, waiting {wait_time}s")
+                            await asyncio.sleep(wait_time)
+                        except APIError as e:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Retry {attempt + 1}/{max_retries} for {order_id}: {e}")
+                                await asyncio.sleep(0.2)
+                            else:
+                                total_failed += 1
+                                logger.error(f"Failed to cancel stale order {order_id}: {e}")
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Retry {attempt + 1}/{max_retries} for {order_id}: {e}")
+                                await asyncio.sleep(0.2)
+                            else:
+                                total_failed += 1
+                                logger.error(f"Failed to cancel stale order {order_id}: {e}")
+
+            except Exception as e:
+                logger.error(f"Failed to fetch orders for {ticker}: {e}")
+
+        if total_cancelled > 0 or total_failed > 0:
+            logger.info(
+                f"Stale order cleanup complete: {total_cancelled} cancelled, "
+                f"{total_failed} failed"
+            )
 
     async def _emergency_shutdown(self, reason: str) -> None:
         """Emergency shutdown - cancel all orders on all markets and stop."""

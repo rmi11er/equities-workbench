@@ -209,11 +209,32 @@ class TestDebouncing:
         assert engine.should_update("TEST", target)
 
     def test_should_not_update_small_change(self, engine):
-        """Test update doesn't trigger on small price change."""
+        """Test update doesn't trigger on small price change when orders exist."""
         state = engine.get_quote_state("TEST")
         state.last_bid_price = 48
         state.last_ask_price = 52
         state.last_update = time.monotonic()
+        # Must have existing orders, otherwise we always update to fill the gap
+        state.bid_order = Order(
+            order_id="bid-123",
+            ticker="TEST",
+            side=OrderSide.BUY,
+            price=48,
+            size=10,
+            remaining=10,
+            filled=0,
+            status=OrderStatus.RESTING,
+        )
+        state.ask_order = Order(
+            order_id="ask-123",
+            ticker="TEST",
+            side=OrderSide.SELL,
+            price=52,
+            size=10,
+            remaining=10,
+            filled=0,
+            status=OrderStatus.RESTING,
+        )
 
         target = StrategyOutput(
             bid_price=47,  # 1 cent change < 2 cent threshold
@@ -252,7 +273,8 @@ class TestExecution:
 
     @pytest.fixture
     def config(self):
-        return StrategyConfig()
+        # Disable depth-based retreat for basic execution tests
+        return StrategyConfig(min_join_depth_dollars=0)
 
     @pytest.fixture
     def mock_connector(self):
@@ -271,13 +293,15 @@ class TestExecution:
     @pytest.mark.asyncio
     async def test_execute_create(self, engine, mock_connector):
         """Test executing a create diff."""
-        # Set market state for validation (bid=45, ask=52)
-        engine.set_market_state("TEST", best_bid=45, best_ask=52)
+        # Set market state for validation (bid=48, ask=52)
+        # Include cumulative book depth so we pass the min_join_depth check
+        # Depth at 48 (best bid) and 47 gives cumulative 150 >= 100 threshold
+        engine.set_market_state("TEST", best_bid=48, best_ask=52, book_depth={48: 100, 47: 50})
 
         bid_diff = OrderDiff(
             action=OrderAction.CREATE,
             side=OrderSide.BUY,
-            price=48,  # Below ask, won't cross
+            price=47,  # At/below best bid, won't cross
             size=10,
         )
         ask_diff = OrderDiff(action=OrderAction.NONE)

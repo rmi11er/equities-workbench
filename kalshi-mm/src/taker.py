@@ -227,6 +227,10 @@ class ImpulseEngine:
         """
         threshold = self.risk_config.bailout_threshold
 
+        return None
+
+        # TODO: we need to relax reserevation trigger
+
         if inventory > 0 and best_bid is not None:
             # Long: if reservation drops below best bid, we're overexposed
             if reservation_price < (best_bid - threshold):

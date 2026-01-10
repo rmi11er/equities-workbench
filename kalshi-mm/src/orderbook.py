@@ -231,55 +231,172 @@ class OrderBook:
 
     def get_effective_quote(self, min_depth: int) -> tuple[int, int]:
         """
-        Get effective bid/ask prices that represent "real" liquidity.
+        Get effective bid/ask prices that represent "real" liquidity (BBO-clamped).
 
-        For deep books: Walks through until cumulative volume >= min_depth,
-        finding the price level where real liquidity exists (ignoring dust).
-
-        IMPORTANT: The effective quote is used to calculate our mid price for
-        quoting. We should NEVER return prices that would cause our quotes to
-        cross the actual BBO. Therefore:
-        - effective_bid is always >= best_bid (we use BBO as the floor)
-        - effective_ask is always <= best_ask (we use BBO as the ceiling)
-
-        The effective quote represents where we believe "fair" value is based
-        on liquidity depth, but clamped to the actual market.
+        Used for MID PRICE calculation. Returns depth-weighted prices but clamped
+        to BBO so the mid price never falls outside the actual market spread.
 
         Args:
             min_depth: Minimum contracts required to define "real" price
 
         Returns:
-            (effective_bid, effective_ask) tuple, always respecting actual BBO.
+            (effective_bid, effective_ask) tuple, clamped to BBO.
         """
-        # Get actual BBO first - these are our bounds
+        best_bid = self.best_yes_bid()
+        best_ask = self.best_yes_ask()
+
+        # Get unclamped depth prices
+        depth_bid, depth_ask = self.get_depth_levels(min_depth)
+
+        # Clamp to BBO for mid price calculation
+        effective_bid = max(depth_bid, best_bid) if best_bid else depth_bid
+        effective_ask = min(depth_ask, best_ask) if best_ask else depth_ask
+
+        return effective_bid, effective_ask
+
+    def get_depth_levels(self, min_depth: int) -> tuple[int, int]:
+        """
+        Get the price levels where min_depth contracts exist (UNCLAMPED).
+
+        Used for SPREAD BOUNDS. Walks the book to find where real liquidity
+        exists, without clamping to BBO. This tells us the bounds within which
+        we should quote - we shouldn't bid above where real bid depth exists,
+        and shouldn't ask below where real ask depth exists.
+
+        Args:
+            min_depth: Minimum contracts required to define "real" price
+
+        Returns:
+            (depth_bid, depth_ask) tuple - the prices where min_depth is found.
+            In thin books, these will be worse than BBO.
+        """
         best_bid = self.best_yes_bid()
         best_ask = self.best_yes_ask()
 
         # Default to BBO (or fallback if no book)
-        effective_bid = best_bid if best_bid is not None else 1
-        effective_ask = best_ask if best_ask is not None else 99
+        depth_bid = best_bid if best_bid is not None else 1
+        depth_ask = best_ask if best_ask is not None else 99
 
-        # Walk bids (descending price) to find depth-weighted price
+        # Walk bids (descending price) to find where min_depth exists
         cumulative_bid = 0
         for price in sorted(self.yes_bids.keys(), reverse=True):
             cumulative_bid += self.yes_bids[price]
             if cumulative_bid >= min_depth:
-                # Found sufficient depth at this price
-                # But never go below best_bid
-                effective_bid = max(price, best_bid) if best_bid else price
+                depth_bid = price
                 break
 
-        # Walk asks (ascending price) to find depth-weighted price
+        # Walk asks (ascending price) to find where min_depth exists
         cumulative_ask = 0
         for price in sorted(self.yes_asks.keys()):
             cumulative_ask += self.yes_asks[price]
             if cumulative_ask >= min_depth:
-                # Found sufficient depth at this price
-                # But never go above best_ask
-                effective_ask = min(price, best_ask) if best_ask else price
+                depth_ask = price
                 break
 
-        return effective_bid, effective_ask
+        return depth_bid, depth_ask
+
+    def clamp_quotes_to_depth(
+        self,
+        strategy_bid: int,
+        strategy_ask: int,
+        min_depth: int,
+    ) -> tuple[int, int]:
+        """
+        Clamp strategy quotes based on market liquidity depth.
+
+        This is the core quoting logic:
+        1. LIQUID BBO (depth >= min_depth at BBO): Tighten to BBO
+           - In liquid markets, we want to quote AT the BBO
+           - bid = max(strategy_bid, best_bid) - push UP to BBO
+           - ask = min(strategy_ask, best_ask) - push DOWN to BBO
+
+        2. THIN BBO (depth < min_depth at BBO): Widen to depth levels
+           - In thin markets, we quote at where real liquidity exists
+           - bid = min(strategy_bid, depth_bid) - push DOWN to depth
+           - ask = max(strategy_ask, depth_ask) - push UP to depth
+
+        Args:
+            strategy_bid: The bid price from strategy (e.g., Stoikov)
+            strategy_ask: The ask price from strategy
+            min_depth: Minimum contracts to consider "liquid"
+
+        Returns:
+            (clamped_bid, clamped_ask) - the final quote prices
+        """
+        best_bid = self.best_yes_bid()
+        best_ask = self.best_yes_ask()
+
+        # Handle empty/one-sided books
+        if best_bid is None and best_ask is None:
+            return 1, 99
+
+        # Get depth levels (where min_depth contracts exist)
+        depth_bid, depth_ask = self.get_depth_levels(min_depth)
+
+        # Determine liquidity state for each side and clamp accordingly
+        clamped_bid = self._clamp_bid(strategy_bid, best_bid, depth_bid)
+        clamped_ask = self._clamp_ask(strategy_ask, best_ask, depth_ask)
+
+        # Ensure quotes don't cross
+        if clamped_bid >= clamped_ask:
+            # Try to use depth levels
+            if depth_bid < depth_ask:
+                clamped_bid = depth_bid
+                clamped_ask = depth_ask
+            # Fall back to BBO if available
+            elif best_bid is not None and best_ask is not None and best_bid < best_ask:
+                clamped_bid = best_bid
+                clamped_ask = best_ask
+            # Last resort
+            else:
+                clamped_bid = 1
+                clamped_ask = 99
+
+        return clamped_bid, clamped_ask
+
+    def _clamp_bid(
+        self,
+        strategy_bid: int,
+        best_bid: Optional[int],
+        depth_bid: int,
+    ) -> int:
+        """
+        Clamp bid based on liquidity.
+
+        - If BBO is liquid (depth_bid == best_bid): push UP to BBO
+        - If BBO is thin (depth_bid < best_bid): push DOWN to depth
+        """
+        if best_bid is None:
+            return 1  # No bids, use fallback
+
+        if depth_bid == best_bid:
+            # Liquid at BBO - tighten to BBO (push bid UP)
+            return max(strategy_bid, best_bid)
+        else:
+            # Thin at BBO - widen to depth (push bid DOWN)
+            return min(strategy_bid, depth_bid)
+
+    def _clamp_ask(
+        self,
+        strategy_ask: int,
+        best_ask: Optional[int],
+        depth_ask: int,
+    ) -> int:
+        """
+        Clamp ask based on liquidity.
+
+        - If BBO is liquid (depth_ask == best_ask): push DOWN to BBO
+        - If BBO is thin (depth_ask > best_ask): push UP to depth
+        """
+        if best_ask is None:
+            return 99  # No asks, use fallback
+
+        if depth_ask == best_ask:
+            # Liquid at BBO - tighten to BBO (push ask DOWN)
+            return min(strategy_ask, best_ask)
+        else:
+            # Thin at BBO - widen to depth (push ask UP)
+            return max(strategy_ask, depth_ask)
 
     def get_effective_spread(self, min_depth: int) -> float:
         """

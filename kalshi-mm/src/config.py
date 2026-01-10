@@ -39,13 +39,14 @@ class StrategyConfig:
     gamma: float = 0.05          # alias for risk_aversion (V2)
 
     # Position limits
-    max_inventory: int = 500
-    max_order_size: int = 100    # fat finger protection
+    max_inventory: int = 50
+    max_order_size: int = 50    # fat finger protection
 
     # Quote generation
     base_spread: float = 2.0     # base spread in cents
     min_absolute_spread: float = 2.0  # minimum spread floor (safety net below Stoikov math)
-    quote_size: int = 10         # default quote size
+    max_spread: float = 0.0      # maximum spread ceiling (0 = no ceiling, use for tight quoting in liquid markets)
+    quote_size: int = 50         # default quote size
 
     # Depth-based pricing (V2)
     effective_depth_contracts: int = 100  # contracts required to define "real" price
@@ -53,9 +54,15 @@ class StrategyConfig:
     # Time horizon for expiry urgency
     time_normalization_sec: float = 86400.0  # 1 day - expiries beyond this treated as T-t=1.0
 
-    # Debouncing
-    debounce_cents: int = 2
-    debounce_seconds: float = 5.0
+    # Debouncing / Queue-aware amendments
+    debounce_cents: int = 4           # amend immediately if price change >= this
+    debounce_seconds: float = 15.0     # time-based updates only when queue position is bad
+    queue_position_threshold: int = 500  # only amend if queue position > this (0 = always amend)
+
+    # Liquidity joining - avoid being alone on a price level
+    min_join_depth_dollars: float = 200.0  # min $ of liquidity to join (0 = disabled)
+    allow_solo_if_edge: int = 7       # allow solo if our edge to mid >= this many cents
+    max_retreat: int = 15             # max cents to retreat to find joinable level
 
 
 @dataclass
@@ -215,8 +222,12 @@ class Config:
             quote_size=strat_data.get("quote_size", 10),
             effective_depth_contracts=strat_data.get("effective_depth_contracts", 100),
             time_normalization_sec=strat_data.get("time_normalization_sec", 86400.0),
-            debounce_cents=strat_data.get("debounce_cents", 2),
-            debounce_seconds=strat_data.get("debounce_seconds", 5.0),
+            debounce_cents=strat_data.get("debounce_cents", 4),
+            debounce_seconds=strat_data.get("debounce_seconds", 15.0),
+            queue_position_threshold=strat_data.get("queue_position_threshold", 500),
+            min_join_depth_dollars=strat_data.get("min_join_depth_dollars", 25.0),
+            allow_solo_if_edge=strat_data.get("allow_solo_if_edge", 3),
+            max_retreat=strat_data.get("max_retreat", 10),
         )
 
         vol_data = data.get("volatility", {})

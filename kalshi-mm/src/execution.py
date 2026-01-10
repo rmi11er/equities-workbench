@@ -9,9 +9,10 @@ from enum import Enum, auto
 from typing import Optional, TYPE_CHECKING
 
 from .config import StrategyConfig
-from .connector import KalshiConnector, APIError
+from .connector import KalshiConnector, APIError, RateLimitError
 from .constants import OrderSide, OrderStatus
 from .types import Order, StrategyOutput
+from .volatility_regime import VolatilityRegime
 
 if TYPE_CHECKING:
     from .decision_log import DecisionLogger, FillEvent
@@ -65,11 +66,13 @@ class ExecutionEngine:
         connector: KalshiConnector,
         decision_logger: Optional["DecisionLogger"] = None,
         max_consecutive_errors: int = 5,
+        volatility_regime: Optional[VolatilityRegime] = None,
     ):
         self.config = config
         self.connector = connector
         self.decision_logger = decision_logger
         self.max_consecutive_errors = max_consecutive_errors
+        self.volatility_regime = volatility_regime
 
         # State per ticker
         self._quotes: dict[str, QuoteState] = {}
@@ -86,18 +89,219 @@ class ExecutionEngine:
         # Market state for validation (set by market_maker before updates)
         self._best_bid: dict[str, int] = {}
         self._best_ask: dict[str, int] = {}
+        self._book_depth: dict[str, dict[int, int]] = {}  # ticker -> {price: size}
+        self._mid_price: dict[str, float] = {}
 
     # -------------------------------------------------------------------------
     # Guardrails / Validation
     # -------------------------------------------------------------------------
 
-    def set_market_state(self, ticker: str, best_bid: int, best_ask: int) -> None:
+    def set_market_state(
+        self,
+        ticker: str,
+        best_bid: int,
+        best_ask: int,
+        book_depth: Optional[dict[int, int]] = None,
+    ) -> None:
         """
         Update market state for order validation.
         Must be called before update_quotes.
+
+        Args:
+            ticker: Market ticker
+            best_bid: Best bid price
+            best_ask: Best ask price
+            book_depth: Optional dict of {price: size} for depth checking
         """
         self._best_bid[ticker] = best_bid
         self._best_ask[ticker] = best_ask
+        if best_bid and best_ask:
+            self._mid_price[ticker] = (best_bid + best_ask) / 2
+        if book_depth is not None:
+            self._book_depth[ticker] = book_depth
+
+    def get_depth_at_price(self, ticker: str, price: int) -> int:
+        """Get the book depth at a specific price level."""
+        depth = self._book_depth.get(ticker, {})
+        return depth.get(price, 0)
+
+    def get_min_depth_contracts(self, ticker: str, price: int) -> int:
+        """
+        Convert dollar-based depth threshold to contract count.
+
+        At 1c: $200 / $0.01 = 20,000 contracts needed
+        At 50c: $200 / $0.50 = 400 contracts needed
+
+        In high-vol regime, a decaying multiplier is applied.
+
+        Args:
+            ticker: Market ticker (for regime lookup)
+            price: Price in cents (1-99)
+
+        Returns:
+            Minimum contracts required at this price level
+        """
+        if self.config.min_join_depth_dollars <= 0:
+            return 0
+        if price <= 0:
+            return 0
+
+        # Get regime multiplier (1.0 in normal, higher in high-vol)
+        multiplier = 1.0
+        if self.volatility_regime:
+            multiplier = self.volatility_regime.get_depth_multiplier(ticker)
+
+        # Apply multiplier to dollar threshold
+        effective_dollars = self.config.min_join_depth_dollars * multiplier
+
+        # Convert to contracts
+        price_dollars = price / 100.0
+        return int(effective_dollars / price_dollars)
+
+    def should_skip_for_low_depth(
+        self,
+        ticker: str,
+        price: int,
+        is_bid: bool,
+    ) -> tuple[bool, str]:
+        """
+        Check if we should skip placing an order due to low cumulative depth.
+
+        We avoid being alone on a price level unless:
+        1. There's sufficient cumulative depth from best to our level (dollar-based)
+        2. We have good edge to mid (allow_solo_if_edge)
+
+        Returns:
+            (should_skip, reason)
+        """
+        min_depth = self.get_min_depth_contracts(ticker, price)
+        if min_depth <= 0:
+            return False, ""  # Feature disabled
+
+        # Check cumulative depth from best to target price
+        cumulative_depth = self.get_cumulative_depth(ticker, price, is_bid)
+        if cumulative_depth >= min_depth:
+            return False, ""  # Enough cumulative liquidity to join
+
+        # Check if we have enough edge to go solo
+        mid = self._mid_price.get(ticker)
+        if mid is not None:
+            if is_bid:
+                edge = mid - price  # How far below mid we're bidding
+            else:
+                edge = price - mid  # How far above mid we're asking
+
+            if edge >= self.config.allow_solo_if_edge:
+                return False, ""  # Good edge, OK to be alone
+
+        return True, f"Low cumulative depth ({cumulative_depth}) to {price} (need {min_depth}), would be exposed"
+
+    def get_cumulative_depth(
+        self,
+        ticker: str,
+        price: int,
+        is_bid: bool,
+    ) -> int:
+        """
+        Get cumulative depth from best price to the given price level.
+
+        For bids: sum depth from best_bid down to price (inclusive)
+        For asks: sum depth from best_ask up to price (inclusive)
+
+        Args:
+            ticker: Market ticker
+            price: Target price level
+            is_bid: True for bid side, False for ask side
+
+        Returns:
+            Cumulative contracts from best to this level
+        """
+        book_depth = self._book_depth.get(ticker, {})
+        if not book_depth:
+            return 0
+
+        cumulative = 0
+        if is_bid:
+            best = self._best_bid.get(ticker)
+            if best is None:
+                return 0
+            # Sum from best_bid down to price
+            for p in range(best, price - 1, -1):
+                cumulative += book_depth.get(p, 0)
+        else:
+            best = self._best_ask.get(ticker)
+            if best is None:
+                return 0
+            # Sum from best_ask up to price
+            for p in range(best, price + 1):
+                cumulative += book_depth.get(p, 0)
+
+        return cumulative
+
+    def find_joinable_price(
+        self,
+        ticker: str,
+        target_price: int,
+        is_bid: bool,
+    ) -> Optional[int]:
+        """
+        Find the nearest price level with sufficient cumulative depth to join.
+
+        Instead of skipping a quote entirely when depth is low, we "retreat"
+        to a worse price where cumulative depth from best to that level meets
+        our dollar-based threshold (with volatility regime multiplier applied).
+
+        Args:
+            ticker: Market ticker
+            target_price: The ideal price from strategy
+            is_bid: True for bids (retreat = lower prices), False for asks (retreat = higher)
+
+        Returns:
+            Adjusted price with sufficient cumulative depth, or None if no joinable level found
+        """
+        min_depth = self.get_min_depth_contracts(ticker, target_price)
+        if min_depth <= 0:
+            return target_price  # Feature disabled, use original price
+
+        max_retreat = self.config.max_retreat
+        mid = self._mid_price.get(ticker)
+
+        # Check cumulative depth at original price first
+        cumulative = self.get_cumulative_depth(ticker, target_price, is_bid)
+        if cumulative >= min_depth:
+            return target_price
+
+        # Check if we have enough edge to go solo at target price
+        if mid is not None:
+            if is_bid:
+                edge = mid - target_price
+            else:
+                edge = target_price - mid
+            if edge >= self.config.allow_solo_if_edge:
+                return target_price  # Good edge, OK to be alone
+
+        # Walk backwards to find a level with sufficient cumulative depth
+        # For bids: look at lower prices (worse for us as buyer)
+        # For asks: look at higher prices (worse for us as seller)
+        for offset in range(1, max_retreat + 1):
+            if is_bid:
+                check_price = target_price - offset
+                if check_price < 1:
+                    break
+            else:
+                check_price = target_price + offset
+                if check_price > 99:
+                    break
+
+            # Recalculate min_depth for retreated price (it changes with price and regime)
+            min_depth_at_price = self.get_min_depth_contracts(ticker, check_price)
+            cumulative = self.get_cumulative_depth(ticker, check_price, is_bid)
+            if cumulative >= min_depth_at_price:
+                # Don't log here - caller will log if they actually use the retreated price
+                return check_price
+
+        # No joinable level found within max_retreat
+        return None
 
     def validate_order(
         self,
@@ -254,16 +458,30 @@ class ExecutionEngine:
     # Debouncing
     # -------------------------------------------------------------------------
 
-    def should_update(self, ticker: str, target: StrategyOutput) -> bool:
+    def should_update(
+        self,
+        ticker: str,
+        target: StrategyOutput,
+        should_bid: bool = True,
+        should_ask: bool = True,
+    ) -> bool:
         """
         Check if we should update quotes (debouncing logic).
 
         Updates only when:
+        - Missing an order that we should have (immediate re-quote after fill)
         - Price change exceeds threshold, OR
         - Time since last update exceeds threshold
         """
         state = self.get_quote_state(ticker)
         now = time.monotonic()
+
+        # CRITICAL: If we should have an order but don't, update immediately
+        # This ensures we re-quote after fills instead of waiting for debounce
+        if should_bid and state.bid_order is None:
+            return True
+        if should_ask and state.ask_order is None:
+            return True
 
         # Time-based: always update after debounce_seconds
         time_elapsed = now - state.last_update
@@ -317,43 +535,159 @@ class ExecutionEngine:
                     logger.error(f"Cancel failed: {e}")
                     self.record_api_error()
 
-        # Execute amends
+        # Execute amends (with queue-position-aware logic)
         for diff, attr, side_str in [
             (bid_diff, "bid_order", "yes"),   # Bids are YES orders
             (ask_diff, "ask_order", "no"),    # Asks are NO orders
         ]:
             if diff.action == OrderAction.AMEND and diff.order_id:
                 try:
-                    # CRITICAL: Convert YES ask price to NO buy price
-                    api_price = diff.price
-                    if side_str == "no" and diff.price is not None:
-                        api_price = 100 - diff.price
-                        logger.debug(f"Converting amend ask: YES@{diff.price} -> NO@{api_price}")
+                    # Get current order for fallback values and client_order_id
+                    order = getattr(state, attr)
+
+                    # CRITICAL: Need client_order_id for Kalshi amend API
+                    if not order or not order.client_order_id:
+                        logger.warning(
+                            f"Cannot amend order {diff.order_id}: no client_order_id. "
+                            f"Cancelling and recreating instead."
+                        )
+                        # Cancel and let next tick recreate with proper tracking
+                        try:
+                            await self.connector.cancel_order(diff.order_id)
+                        except APIError:
+                            pass
+                        # Always clear state so we create fresh on next tick
+                        setattr(state, attr, None)
+                        continue
+
+                    # Calculate price delta to determine if this is a significant change
+                    price_delta = abs(diff.price - order.price) if diff.price is not None else 0
+                    size_delta = abs(diff.size - order.remaining) if diff.size is not None else 0
+
+                    # Queue-aware amendment logic:
+                    # - Significant price change (>= debounce_cents): amend immediately
+                    # - Small change: only amend if we're at the back of the queue
+                    queue_threshold = self.config.queue_position_threshold
+                    should_amend = False
+                    queue_position = None
+
+                    if price_delta >= self.config.debounce_cents:
+                        # Significant price move - amend regardless of queue position
+                        should_amend = True
+                        logger.debug(
+                            f"Amend triggered by price delta: {price_delta}c >= {self.config.debounce_cents}c"
+                        )
+                    elif queue_threshold > 0:
+                        # Small change - check queue position first
+                        try:
+                            queue_position = await self.connector.get_queue_position(diff.order_id)
+                            if queue_position > queue_threshold:
+                                # Bad queue position, OK to amend
+                                should_amend = True
+                                logger.debug(
+                                    f"Amend allowed: queue_pos={queue_position} > threshold={queue_threshold}"
+                                )
+                            else:
+                                # Good queue position - preserve it
+                                logger.info(
+                                    f"Skipping amend to preserve queue priority: "
+                                    f"queue_pos={queue_position} <= threshold={queue_threshold}, "
+                                    f"price_delta={price_delta}c, size_delta={size_delta}"
+                                )
+                                continue
+                        except APIError as e:
+                            # If we can't get queue position, default to amending
+                            logger.warning(f"Failed to get queue position: {e}, proceeding with amend")
+                            should_amend = True
+                    else:
+                        # queue_threshold=0 means always amend (disabled)
+                        should_amend = True
+
+                    if not should_amend:
+                        continue
+
+                    # Apply retreat logic to find joinable price (same as CREATE)
+                    is_bid = (side_str == "yes")
+                    target_price = diff.price if diff.price is not None else order.price
+                    adjusted_price = self.find_joinable_price(
+                        ticker=ticker,
+                        target_price=target_price,
+                        is_bid=is_bid,
+                    )
+
+                    if adjusted_price is None:
+                        # No joinable level found - keep current order rather than amend to exposed price
+                        logger.info(
+                            f"Skipping amend: no joinable level found for "
+                            f"{'bid' if is_bid else 'ask'} at {target_price}, keeping order at {order.price}"
+                        )
+                        continue
+
+                    # If adjusted price equals current order price, no need to amend
+                    if adjusted_price == order.price and (diff.size is None or diff.size == order.remaining):
+                        logger.debug(
+                            f"Skipping amend: adjusted price {adjusted_price} equals current order price"
+                        )
+                        continue
+
+                    # Log the amend decision
+                    logger.info(
+                        f"Amend: {ticker} {side_str}, "
+                        f"price {order.price}->{adjusted_price} (target={target_price}, delta={price_delta}), "
+                        f"size {order.remaining}->{diff.size or order.remaining}, "
+                        f"queue_pos={queue_position}"
+                    )
+
+                    # CRITICAL: Kalshi API requires BOTH price AND count on amends
+                    # Use adjusted price (with retreat logic applied)
+                    yes_price = adjusted_price
+                    amend_count = diff.size if diff.size is not None else order.remaining
+
+                    # Safeguard: skip amend if we can't determine price or count
+                    if yes_price is None or amend_count is None:
+                        logger.error(
+                            f"Cannot amend order {diff.order_id}: "
+                            f"price={yes_price}, count={amend_count}, order={order}"
+                        )
+                        continue
+
+                    # Convert YES price to NO price for ask side
+                    api_price = yes_price
+                    if side_str == "no":
+                        api_price = 100 - yes_price
 
                     resp = await self.connector.amend_order(
                         order_id=diff.order_id,
+                        ticker=ticker,
                         side=side_str,
+                        client_order_id=order.client_order_id,
                         price=api_price,
-                        count=diff.size,
+                        count=amend_count,
                     )
-                    # Update our state
-                    order = getattr(state, attr)
-                    if order:
-                        if diff.price is not None:
-                            order.price = diff.price
-                        if diff.size is not None:
-                            order.remaining = diff.size
-                    logger.info(f"Amended order {diff.order_id}: price={diff.price}, size={diff.size}")
+
+                    # Update our state including new client_order_id
+                    # Use adjusted_price (not diff.price) since we may have retreated
+                    order.price = adjusted_price
+                    if diff.size is not None:
+                        order.remaining = diff.size
+                    # Update client_order_id for future amends
+                    if "updated_client_order_id" in resp:
+                        order.client_order_id = resp["updated_client_order_id"]
+
+                    logger.info(f"Amended order {diff.order_id}: price={adjusted_price}, size={diff.size}")
                     self.record_api_success()
                 except APIError as e:
                     logger.error(f"Amend failed: {e}")
                     self.record_api_error()
                     # On failure, cancel and recreate
+                    # Always clear state - if amend failed, order may be gone (filled/cancelled)
                     try:
                         await self.connector.cancel_order(diff.order_id)
-                        setattr(state, attr, None)
                     except APIError:
+                        # Cancel failed too (order already gone) - that's fine
                         pass
+                    # Clear state regardless so we don't keep trying to amend a dead order
+                    setattr(state, attr, None)
 
         # Execute creates
         for diff, attr, side_str in [
@@ -379,10 +713,41 @@ class ExecutionEngine:
                         logger.warning(f"Quote skipped (would cross): {error_msg}")
                         continue  # Skip this order
 
+                    # GUARDRAIL: Find joinable price level (avoid being alone)
+                    # Use YES price for depth check (diff.price is always in YES terms)
+                    is_bid = (side_str == "yes")
+                    adjusted_price = self.find_joinable_price(
+                        ticker=ticker,
+                        target_price=diff.price,
+                        is_bid=is_bid,
+                    )
+                    if adjusted_price is None:
+                        logger.info(
+                            f"Quote skipped: no joinable level found within retreat range "
+                            f"for {'bid' if is_bid else 'ask'} at {diff.price}"
+                        )
+                        continue  # Skip only if no joinable level exists
+
+                    # Use adjusted price for the order
+                    final_yes_price = adjusted_price
+                    final_api_price = adjusted_price
+                    if side_str == "no":
+                        final_api_price = 100 - adjusted_price
+
+                    # Re-validate with adjusted price (in case retreat crossed spread)
+                    is_valid, error_msg = self.validate_order(
+                        ticker=ticker,
+                        side=side_str,
+                        price=final_api_price,
+                    )
+                    if not is_valid:
+                        logger.warning(f"Quote skipped (adjusted price would cross): {error_msg}")
+                        continue
+
                     resp = await self.connector.create_order(
                         ticker=ticker,
                         side=side_str,
-                        price=api_price,
+                        price=final_api_price,
                         count=diff.size,
                     )
 
@@ -392,14 +757,21 @@ class ExecutionEngine:
                         order_id=order_data["order_id"],
                         ticker=ticker,
                         side=diff.side,
-                        price=diff.price,
+                        price=final_yes_price,  # Store the actual price we used
                         size=diff.size,
                         remaining=diff.size,
                         filled=0,
                         status=OrderStatus.RESTING,
+                        client_order_id=order_data.get("client_order_id"),
                     )
                     setattr(state, attr, order)
-                    logger.info(f"Created order {order.order_id}: {diff.side.value} {diff.size}@{diff.price}")
+                    if final_yes_price != diff.price:
+                        logger.info(
+                            f"Created order {order.order_id}: {diff.side.value} {diff.size}@{final_yes_price} "
+                            f"(retreated from {diff.price})"
+                        )
+                    else:
+                        logger.info(f"Created order {order.order_id}: {diff.side.value} {diff.size}@{final_yes_price}")
                     self.record_api_success()
 
                 except APIError as e:
@@ -424,8 +796,8 @@ class ExecutionEngine:
             should_ask: Whether to maintain an ask
             force: Skip debouncing check
         """
-        # Check debouncing
-        if not force and not self.should_update(ticker, target):
+        # Check debouncing (pass should_bid/ask to detect missing orders after fills)
+        if not force and not self.should_update(ticker, target, should_bid, should_ask):
             return
 
         # Compute diff
@@ -449,17 +821,18 @@ class ExecutionEngine:
         """
         Cancel all orders (panic mode).
 
-        Uses individual cancels as primary method since batch cancel
-        endpoint may not exist on all Kalshi API versions.
+        Uses individual cancels with staggered timing to avoid rate limits.
+        Includes retry logic for transient failures.
 
         Args:
             ticker: If provided, only cancel for this ticker
         """
         logger.warning(f"CANCEL ALL triggered for ticker={ticker}")
 
-        # Always use individual cancels - more reliable
         cancelled_count = 0
         failed_count = 0
+        max_retries = 3
+        base_delay = 0.15  # 150ms between cancels to stay under rate limit
 
         try:
             orders = await self.connector.get_orders(ticker)
@@ -470,19 +843,39 @@ class ExecutionEngine:
             else:
                 logger.info(f"Found {len(resting_orders)} resting orders to cancel")
 
-                for order in resting_orders:
+                for i, order in enumerate(resting_orders):
                     order_id = order.get("order_id")
-                    try:
-                        await self.connector.cancel_order(order_id)
-                        cancelled_count += 1
-                        logger.info(f"Cancelled order {order_id}")
-                    except APIError as cancel_err:
-                        failed_count += 1
-                        logger.error(f"Failed to cancel order {order_id}: {cancel_err}")
-                    except Exception as e:
-                        # Network errors (DNS, connection, etc.)
-                        failed_count += 1
-                        logger.error(f"Network error cancelling order {order_id}: {e}")
+
+                    # Stagger requests to avoid rate limit
+                    if i > 0:
+                        await asyncio.sleep(base_delay)
+
+                    # Retry logic for transient failures
+                    for attempt in range(max_retries):
+                        try:
+                            await self.connector.cancel_order(order_id)
+                            cancelled_count += 1
+                            logger.info(f"Cancelled order {order_id}")
+                            break
+                        except RateLimitError:
+                            # Rate limited - wait longer and retry
+                            wait_time = 0.5 * (attempt + 1)
+                            logger.warning(f"Rate limited cancelling {order_id}, waiting {wait_time}s")
+                            await asyncio.sleep(wait_time)
+                        except APIError as cancel_err:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Retry {attempt + 1}/{max_retries} for {order_id}: {cancel_err}")
+                                await asyncio.sleep(0.2)
+                            else:
+                                failed_count += 1
+                                logger.error(f"Failed to cancel order {order_id} after {max_retries} attempts: {cancel_err}")
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Retry {attempt + 1}/{max_retries} for {order_id}: {e}")
+                                await asyncio.sleep(0.2)
+                            else:
+                                failed_count += 1
+                                logger.error(f"Network error cancelling order {order_id}: {e}")
 
                 logger.info(f"Cancel complete: {cancelled_count} cancelled, {failed_count} failed")
 
@@ -502,6 +895,126 @@ class ExecutionEngine:
         """Pull quotes for a specific ticker (data stale, etc.)."""
         logger.warning(f"Pulling quotes for {ticker}")
         await self.cancel_all(ticker)
+
+    async def check_and_pull_exposed_quotes(
+        self,
+        ticker: str,
+        best_bid: Optional[int],
+        best_ask: Optional[int],
+        book_depth: Optional[dict[int, int]] = None,
+    ) -> bool:
+        """
+        Check if our quotes are exposed and cancel them immediately.
+
+        A quote is "exposed" when:
+        - Our bid price > market best_bid (we're improving the market, first to get hit)
+        - Our ask price < market best_ask (we're improving the market, first to get hit)
+        - Depth at our price level dropped below threshold (we lost our cover)
+
+        This is called reactively from the orderbook handler, not the tick loop,
+        for faster reaction to adverse market moves.
+
+        Args:
+            ticker: Market ticker
+            best_bid: Current market best bid
+            best_ask: Current market best ask
+            book_depth: Optional dict of {price: size} for depth checking
+
+        Returns:
+            True if any quotes were pulled
+        """
+        state = self._quotes.get(ticker)
+        if not state:
+            return False
+
+        pulled = False
+
+        # Check if bid is exposed (our bid > market best bid)
+        if (
+            state.bid_order
+            and state.bid_order.is_active
+            and best_bid is not None
+            and state.bid_order.price > best_bid
+        ):
+            exposure = state.bid_order.price - best_bid
+            logger.warning(
+                f"[{ticker}] BID EXPOSED by {exposure}c: our_bid={state.bid_order.price} > best_bid={best_bid} - CANCELLING"
+            )
+            try:
+                await self.connector.cancel_order(state.bid_order.order_id)
+                state.bid_order = None
+                pulled = True
+            except Exception as e:
+                logger.error(f"Failed to cancel exposed bid: {e}")
+
+        # Check if ask is exposed (our ask < market best ask)
+        if (
+            state.ask_order
+            and state.ask_order.is_active
+            and best_ask is not None
+            and state.ask_order.price < best_ask
+        ):
+            exposure = best_ask - state.ask_order.price
+            logger.warning(
+                f"[{ticker}] ASK EXPOSED by {exposure}c: our_ask={state.ask_order.price} < best_ask={best_ask} - CANCELLING"
+            )
+            try:
+                await self.connector.cancel_order(state.ask_order.order_id)
+                state.ask_order = None
+                pulled = True
+            except Exception as e:
+                logger.error(f"Failed to cancel exposed ask: {e}")
+
+        # Check if depth at our price levels has thinned dangerously
+        # Only check if we have a depth threshold configured and book_depth provided
+        if book_depth and self.config.min_join_depth_dollars > 0:
+            # Check bid depth
+            if state.bid_order and state.bid_order.is_active:
+                our_bid = state.bid_order.price
+                min_depth = self.get_min_depth_contracts(ticker, our_bid)
+                # Get cumulative depth from best_bid to our level
+                cumulative = 0
+                if best_bid:
+                    for p in range(best_bid, our_bid - 1, -1):
+                        cumulative += book_depth.get(p, 0)
+
+                # If depth dropped below half our threshold, pull the quote
+                if cumulative < min_depth // 2:
+                    logger.warning(
+                        f"[{ticker}] BID DEPTH THINNED: cumulative={cumulative} < {min_depth // 2} "
+                        f"at price={our_bid} - CANCELLING"
+                    )
+                    try:
+                        await self.connector.cancel_order(state.bid_order.order_id)
+                        state.bid_order = None
+                        pulled = True
+                    except Exception as e:
+                        logger.error(f"Failed to cancel thin-depth bid: {e}")
+
+            # Check ask depth
+            if state.ask_order and state.ask_order.is_active:
+                our_ask = state.ask_order.price
+                min_depth = self.get_min_depth_contracts(ticker, our_ask)
+                # Get cumulative depth from best_ask to our level
+                cumulative = 0
+                if best_ask:
+                    for p in range(best_ask, our_ask + 1):
+                        cumulative += book_depth.get(p, 0)
+
+                # If depth dropped below half our threshold, pull the quote
+                if cumulative < min_depth // 2:
+                    logger.warning(
+                        f"[{ticker}] ASK DEPTH THINNED: cumulative={cumulative} < {min_depth // 2} "
+                        f"at price={our_ask} - CANCELLING"
+                    )
+                    try:
+                        await self.connector.cancel_order(state.ask_order.order_id)
+                        state.ask_order = None
+                        pulled = True
+                    except Exception as e:
+                        logger.error(f"Failed to cancel thin-depth ask: {e}")
+
+        return pulled
 
     async def send_ioc_simulation(
         self,
@@ -597,13 +1110,17 @@ class ExecutionEngine:
         """
         state = self.get_quote_state(ticker)
 
-        # Update order state
-        for order in [state.bid_order, state.ask_order]:
+        # Update order state and clear fully-filled orders
+        for attr in ["bid_order", "ask_order"]:
+            order = getattr(state, attr)
             if order and order.order_id == order_id:
                 order.filled += size
                 order.remaining -= size
                 if order.remaining <= 0:
                     order.status = OrderStatus.EXECUTED
+                    # Clear from state so we don't try to amend a dead order
+                    setattr(state, attr, None)
+                    logger.info(f"Order {order_id} fully filled, cleared from state")
                 break
 
         # Calculate P&L impact
