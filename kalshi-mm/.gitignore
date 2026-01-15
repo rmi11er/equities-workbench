@@ -46,6 +46,7 @@ logs/
 
 # Config (contains secrets)
 config.toml
+config_rfq.toml
 *.pem
 *.key
 

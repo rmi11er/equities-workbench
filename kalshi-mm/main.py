@@ -3,7 +3,9 @@
 Kalshi Market Maker - Entry Point
 
 Usage:
-    python main.py --config config.toml
+    python main.py --config config.toml      # Legacy v1/v2
+    python main.py --config config_v3.toml   # Passive MM v3
+    python main.py --config config_rfq.toml  # RFQ Responder
     python main.py --env demo
 """
 
@@ -16,11 +18,7 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.config import load_config, Config
 from src.constants import Environment
-from src.market_maker import MarketMaker
-from src.multi_market import MultiMarketOrchestrator
-from src.run_context import create_run_context
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,13 +58,191 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def main() -> int:
-    args = parse_args()
+def is_v3_config(config_path: Path) -> bool:
+    """Check if config file is v3 format (has [quoting] section)."""
+    if not config_path.exists():
+        return False
+    content = config_path.read_text()
+    return "[quoting]" in content
+
+
+def is_rfq_config(config_path: Path) -> bool:
+    """Check if config file is RFQ format (has [filters] or [pricing] with RFQ settings)."""
+    if not config_path.exists():
+        return False
+    content = config_path.read_text()
+    # RFQ configs have [filters] or [pricing] with default_spread_pct
+    # but not [quoting] (which is v3) or [strategy] (which is legacy)
+    has_filters = "[filters]" in content
+    has_rfq_pricing = "[pricing]" in content and "default_spread_pct" in content
+    has_quoting = "[quoting]" in content
+    has_strategy = "[strategy]" in content
+    return (has_filters or has_rfq_pricing) and not has_quoting and not has_strategy
+
+
+async def run_rfq(args) -> int:
+    """Run RFQ Responder."""
+    from src.rfq import load_rfq_config, RFQResponder
+
+    config_path = Path(args.config)
+    print(f"Loading RFQ config from {config_path}")
+    config = load_rfq_config(str(config_path))
+
+    # Apply environment override
+    if args.env:
+        config.environment = Environment[args.env.upper()]
+        print(f"Environment override: {config.environment.name}")
+
+    # Validate
+    if not config.credentials.api_key_id:
+        print("ERROR: API credentials not configured")
+        return 1
+
+    # Print startup info
+    print(f"\n{'='*60}")
+    print("  RFQ RESPONDER")
+    print(f"{'='*60}")
+    print(f"  Environment: {config.environment.name}")
+    print(f"  Leg Tickers: {len(config.leg_tickers)}")
+    print(f"  Spread: {config.pricing.default_spread_pct*100:.1f}%")
+    print(f"  Max Exposure: ${config.risk.max_exposure_dollars:.0f}")
+    print(f"  Max Active Quotes: {config.risk.max_active_quotes}")
+    print(f"  Filters:")
+    print(f"    - Dollar range: ${config.filters.min_dollars:.0f} - ${config.filters.max_dollars:.0f}")
+    print(f"    - Leg range: {config.filters.min_legs} - {config.filters.max_legs}")
+    print(f"{'='*60}\n")
+
+    # Create responder
+    responder = RFQResponder(config)
+
+    # Setup signal handlers
+    loop = asyncio.get_event_loop()
+    shutdown_event = asyncio.Event()
+
+    def signal_handler():
+        print("\nShutdown signal received...")
+        shutdown_event.set()
+        asyncio.create_task(responder.shutdown())
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler)
+
+    try:
+        responder_task = asyncio.create_task(responder.start())
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
+
+        done, pending = await asyncio.wait(
+            [responder_task, shutdown_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        for task in done:
+            if task.exception():
+                raise task.exception()
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    return 0
+
+
+async def run_v3(args) -> int:
+    """Run Passive Market Maker v3."""
+    from src.v3 import load_config_v3, PassiveQuoter
+
+    config_path = Path(args.config)
+    print(f"Loading v3 config from {config_path}")
+    config = load_config_v3(str(config_path))
+
+    # Apply environment override
+    if args.env:
+        config.environment = Environment[args.env.upper()]
+        print(f"Environment override: {config.environment.name}")
+
+    # Validate
+    if not config.tickers:
+        print("ERROR: No market_tickers configured")
+        return 1
+
+    if not config.credentials.api_key_id:
+        print("ERROR: API credentials not configured")
+        return 1
+
+    # Print startup info
+    print(f"\n{'='*60}")
+    print("  PASSIVE MARKET MAKER v3")
+    print(f"{'='*60}")
+    print(f"  Environment: {config.environment.name}")
+    print(f"  Markets: {len(config.tickers)}")
+    print(f"  Min Market Width: {config.quoting.min_market_width}c")
+    print(f"  Min Join Depth: ${config.quoting.min_join_depth_dollars:.0f}")
+    print(f"  Inventory Gamma: {config.inventory.gamma}")
+    print(f"{'='*60}\n")
+
+    # Create quoter
+    quoter = PassiveQuoter(config)
+
+    # Setup signal handlers
+    loop = asyncio.get_event_loop()
+    shutdown_event = asyncio.Event()
+
+    def signal_handler():
+        print("\nShutdown signal received...")
+        shutdown_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler)
+
+    try:
+        quoter_task = asyncio.create_task(quoter.start())
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
+
+        done, pending = await asyncio.wait(
+            [quoter_task, shutdown_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        for task in done:
+            if task.exception():
+                raise task.exception()
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    return 0
+
+
+async def run_legacy(args) -> int:
+    """Run legacy v1/v2 market maker."""
+    from src.config import load_config, Config
+    from src.market_maker import MarketMaker
+    from src.multi_market import MultiMarketOrchestrator
+    from src.run_context import create_run_context
 
     # Load configuration
     config_path = Path(args.config)
     if config_path.exists():
-        print(f"Loading config from {config_path}")
+        print(f"Loading legacy config from {config_path}")
         config = load_config(config_path)
     else:
         print(f"Config file not found: {config_path}")
@@ -137,7 +313,7 @@ async def main() -> int:
     else:
         print(f"  Ticker: {tickers[0]}")
     print(f"  Risk Aversion: {config.strategy.risk_aversion}")
-    print(f"  Max Inventory: {config.strategy.max_inventory}")
+    print(f"  Max Inventory: ${config.strategy.max_inventory_dollars:.0f}")
     print()
 
     try:
@@ -170,6 +346,22 @@ async def main() -> int:
 
     print("Market maker shutdown complete")
     return 0
+
+
+async def main() -> int:
+    args = parse_args()
+    config_path = Path(args.config)
+
+    # Detect config format: RFQ > v3 > legacy
+    if is_rfq_config(config_path):
+        print("Detected RFQ config format")
+        return await run_rfq(args)
+    elif is_v3_config(config_path):
+        print("Detected v3 config format")
+        return await run_v3(args)
+    else:
+        print("Detected legacy config format")
+        return await run_legacy(args)
 
 
 if __name__ == "__main__":

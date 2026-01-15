@@ -1,0 +1,64 @@
+# RFQ Responder Configuration
+# Responds to Kalshi RFQ requests for combos/parlays
+#
+# Copy this file to config_rfq.toml and fill in your credentials
+
+environment = "demo"  # "demo" or "production"
+
+[credentials]
+api_key_id = "your-api-key-id-here"
+private_key_path = "~/.rsa/private-key.pem"
+
+[pricing]
+# Spread settings (applied symmetrically around theoretical value)
+default_spread_pct = 0.05    # 5% spread on theo
+min_spread_cents = 2         # Minimum spread floor
+max_spread_cents = 15        # Maximum spread cap
+use_bbo_mid = true           # Use BBO mid as primary price source
+
+[risk]
+# Exposure limits
+max_exposure_dollars = 1000.0    # Total $ exposure across all active quotes
+max_single_rfq_dollars = 500.0   # Max $ on any single RFQ
+max_contracts_per_rfq = 5000     # Hard limit on contracts per RFQ
+max_active_quotes = 2            # Max concurrent unconfirmed quotes
+position_limit_per_market = 1000 # Contracts per underlying market
+
+[filters]
+# Dollar-based size filtering (computed as contracts * theo_value)
+min_dollars = 5.0            # Ignore tiny RFQs
+max_dollars = 500.0          # Ignore massive RFQs
+
+# Leg count filtering
+min_legs = 2                 # Only parlays (2+ legs)
+max_legs = 20                # Cap complexity
+
+# Collection filtering (leave empty for all)
+allowed_collections = []     # Whitelist: [] = all collections allowed
+blocked_collections = []     # Blacklist: specific collections to block
+
+# Sport filtering (optional)
+allowed_sports = []          # e.g., ["NFL", "NBA"] - empty = all
+
+[logging]
+log_level = "INFO"
+base_log_dir = "logs/rfq"
+
+[shadow]
+# Shadow/observation mode - quote with wide spreads to observe without executing
+enabled = false               # Set to true for observation mode
+spread_multiplier = 10.0      # Multiply spread by this factor (10x = very uncompetitive)
+log_all_rfqs = true           # Log all RFQs even if filtered out
+track_market_prices = true    # Track market execution prices for comparison
+
+# Response timing
+quote_ttl_seconds = 30.0             # How long our quotes are valid
+confirmation_timeout_seconds = 5.0   # Time to confirm after acceptance
+
+# Markets to subscribe for leg pricing (orderbook data)
+# Add all markets that could appear as legs in RFQs you want to quote
+leg_tickers = [
+    # Example NFL markets
+    # "NFLSB-25-KC",
+    # "NFLSB-25-PHI",
+]
