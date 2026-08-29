@@ -1,0 +1,90 @@
+# Silver-first, read-only Phase 0/R0-R1 collection.
+# Copy to configs/metals.toml for local overrides; that file is gitignored.
+
+# Kalshi API venue only; execution authorization is controlled separately by
+# [shadow] and is hard-locked to non-trading mode.
+environment = "production"
+
+[storage]
+root = "data/metals"
+fsync_every_records = 1
+
+[kalshi]
+rest_url = "https://external-api.kalshi.com/trade-api/v2"
+ws_url = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+credentials_config = "config.toml"
+api_key_id_env = "KALSHI_API_KEY_ID"
+private_key_path_env = "KALSHI_PRIVATE_KEY_PATH"
+page_limit = 1000
+discovery_interval_seconds = 15.0
+request_timeout_seconds = 15.0
+fractional_contracts_enabled = true
+fractional_contract_quantum = "0.01"
+upcoming_markets_per_product = 4
+max_read_requests_per_second = 18.0
+max_read_retries = 5
+read_retry_base_seconds = 0.25
+
+[pyth]
+enabled = false
+api_key_env = "PYTH_API_KEY"
+endpoint = "https://pyth.dourolabs.app/v1"
+lazer_ws_endpoints = [
+  "wss://pyth-lazer-0.dourolabs.app/v1/stream",
+  "wss://pyth-lazer-1.dourolabs.app/v1/stream",
+  "wss://pyth-lazer-2.dourolabs.app/v1/stream",
+]
+history_chunk_seconds = 86400
+
+[cme]
+enabled = false
+provider = "databento"
+api_key_env = "DATABENTO_API_KEY"
+dataset = "GLBX.MDP3"
+stype_in = "parent"
+schemas = ["mbo", "trades", "definition", "status", "statistics"]
+mbo_snapshot = true
+reconnect_policy = "reconnect"
+include_ts_out = true
+
+# Research limits agreed for counterfactual shadow orders. These are not
+# production approvals, and this subsystem has no live-order route.
+[shadow]
+enabled = true
+execution_mode = "shadow"
+allow_live_orders = false
+config_version = "metals-shadow-v1"
+bankroll_min_dollars = "5000"
+bankroll_max_dollars = "10000"
+max_contracts_per_order = "250"
+max_net_contracts_per_market = "1000"
+max_aggregate_worst_case_loss_dollars = "3000"
+max_loss_per_market_dollars = "1000"
+daily_loss_limit_dollars = "3000"
+
+[products.silver]
+enabled = true
+series_tickers = ["KXSILVER15M"]
+ticker_prefixes = ["KXSILVER15M"]
+title_keywords = ["silver"]
+pyth_symbol = "Metal.Index.SILVER/USD"
+pyth_feed_id = "0x6afca47e1c79ecd0d2844327efb463478417a9d498dfb0915ce5e88ae6d952d3"
+pyth_lazer_id = 3154
+cme_symbols = ["SI", "SIL", "SIC"]
+
+[products.gold]
+enabled = false
+series_tickers = ["KXGOLD15M"]
+ticker_prefixes = ["KXGOLD15M"]
+title_keywords = ["gold"]
+pyth_symbol = "Metal.Index.GOLD/USD"
+pyth_feed_id = "0xfa0f57505be633c026896e15afef2c7ce2cf8ff9a45349d1da737f4f01266b01"
+pyth_lazer_id = 3153
+cme_symbols = ["GC", "MGC", "1OZ", "QO"]
+
+[products.copper]
+enabled = false
+series_tickers = []
+ticker_prefixes = []
+title_keywords = ["copper"]
+cme_symbols = ["HG", "MHG"]

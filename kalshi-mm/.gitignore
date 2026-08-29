@@ -56,3 +56,7 @@ Thumbs.db
 
 # Data
 tape.csv
+data/
+
+# Local metals config may contain deployment-specific paths
+configs/metals.toml
