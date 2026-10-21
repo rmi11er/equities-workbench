@@ -1,0 +1,68 @@
+{
+  "schema_version": "metals-provider-approval/v1",
+  "review_version": "replace-with-reviewed-version",
+  "reviewed_at": "2026-08-30T00:00:00Z",
+  "valid_until": null,
+  "providers": {
+    "pyth": {
+      "license": {
+        "version": "pending",
+        "confirmed": false,
+        "evidence_sha256": null
+      },
+      "timestamp_semantics": {
+        "version": "pending",
+        "confirmed": false,
+        "evidence_sha256": null
+      },
+      "operations": {
+        "exact_history": {
+          "approved": false,
+          "entitlement": {
+            "version": "pending",
+            "confirmed": false,
+            "evidence_sha256": null
+          }
+        },
+        "live_lazer": {
+          "approved": false,
+          "entitlement": {
+            "version": "pending",
+            "confirmed": false,
+            "evidence_sha256": null
+          }
+        }
+      }
+    },
+    "databento": {
+      "license": {
+        "version": "pending",
+        "confirmed": false,
+        "evidence_sha256": null
+      },
+      "timestamp_semantics": {
+        "version": "pending",
+        "confirmed": false,
+        "evidence_sha256": null
+      },
+      "operations": {
+        "historical": {
+          "approved": false,
+          "entitlement": {
+            "version": "pending",
+            "confirmed": false,
+            "evidence_sha256": null
+          }
+        },
+        "live": {
+          "approved": false,
+          "entitlement": {
+            "version": "pending",
+            "confirmed": false,
+            "evidence_sha256": null
+          }
+        }
+      }
+    }
+  }
+}

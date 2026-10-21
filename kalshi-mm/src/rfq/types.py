@@ -53,10 +53,17 @@ class RFQ:
     mve_selected_legs: list[RFQLeg] = field(default_factory=list)
 
     # Optional fields
-    target_cost_centi_cents: Optional[int] = None
+    target_cost_centi_cents: Optional[int] = None  # Requester's target price (in centi-cents)
     expires_at: Optional[datetime] = None
     creator_id: Optional[str] = None
     rest_remainder: bool = False
+
+    @property
+    def target_cost_dollars(self) -> Optional[float]:
+        """Requester's target cost in dollars (CashOrderQty equivalent)."""
+        if self.target_cost_centi_cents is None:
+            return None
+        return self.target_cost_centi_cents / 10000.0
 
     @property
     def is_parlay(self) -> bool:
@@ -85,16 +92,54 @@ class QuoteResponse:
     yes_bid: str  # Dollar string like "0.56"
     no_bid: str   # Dollar string like "0.44"
     theo_value: float  # Our calculated fair value (probability 0-1)
-    edge: float  # Edge we're capturing (spread/2)
+    yes_edge: float  # Edge if they sell us YES (theo - yes_bid)
+    no_edge: float   # Edge if they sell us NO ((1-theo) - no_bid)
 
-    def to_api_payload(self) -> dict:
-        """Convert to API request payload."""
-        return {
+    @property
+    def edge(self) -> float:
+        """Best edge across both sides (for backward compatibility)."""
+        return max(self.yes_edge, self.no_edge)
+
+    def to_api_payload(self, one_sided: bool = False) -> dict:
+        """Convert to API request payload.
+
+        Args:
+            one_sided: If True, only include the side with positive edge.
+                      This prevents us from being picked off on the negative edge side.
+        """
+        payload = {
             "rfq_id": self.rfq_id,
-            "yes_bid": self.yes_bid,
-            "no_bid": self.no_bid,
             "rest_remainder": False,
         }
+
+        if one_sided:
+            # Only quote the side with positive edge
+            if self.yes_edge >= 0:
+                payload["yes_bid"] = self.yes_bid
+            if self.no_edge >= 0:
+                payload["no_bid"] = self.no_bid
+        else:
+            # Always include both sides
+            payload["yes_bid"] = self.yes_bid
+            payload["no_bid"] = self.no_bid
+
+        return payload
+
+    @property
+    def is_one_sided(self) -> bool:
+        """Check if this quote should be one-sided (one edge negative)."""
+        return self.yes_edge < 0 or self.no_edge < 0
+
+    @property
+    def profitable_side(self) -> Optional[str]:
+        """Return which side has positive edge, or None if both do."""
+        if self.yes_edge >= 0 and self.no_edge >= 0:
+            return None  # Both sides profitable
+        elif self.yes_edge >= 0:
+            return "yes"
+        elif self.no_edge >= 0:
+            return "no"
+        return None  # Neither side profitable (shouldn't happen)
 
 
 @dataclass

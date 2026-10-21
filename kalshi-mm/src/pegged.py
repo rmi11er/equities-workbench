@@ -62,7 +62,8 @@ class PeggedStrategy:
         """
         fv = self.pegged_config.fair_value
         max_exposure = self.pegged_config.max_exposure
-        max_size = self.strategy_config.max_order_size
+        # Convert max order size from dollars to contracts at fair value
+        max_size = int(self.strategy_config.max_order_size_dollars / (fv / 100)) if fv > 0 else 100
 
         # Fixed pricing: bid at FV-1, ask at FV+1
         bid_price = max(MIN_PRICE, fv - 1)
@@ -149,7 +150,9 @@ class PeggedStrategy:
             (needs_bid_refresh, needs_ask_refresh)
         """
         max_exposure = self.pegged_config.max_exposure
-        max_size = self.strategy_config.max_order_size
+        fv = self.pegged_config.fair_value
+        # Convert max order size from dollars to contracts at fair value
+        max_size = int(self.strategy_config.max_order_size_dollars / (fv / 100)) if fv > 0 else 100
         reload_threshold = self.pegged_config.reload_threshold
 
         target_size = min(max_size, max_exposure - abs(inventory))

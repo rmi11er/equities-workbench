@@ -39,11 +39,11 @@ class TestIntegration:
     def strategy(self):
         config = StrategyConfig(
             risk_aversion=0.05,
-            max_inventory=500,
-            max_order_size=100,
+            max_inventory_dollars=250.0,  # 500 contracts at 50c
+            max_order_size_dollars=50.0,  # 100 contracts at 50c
             base_spread=2.0,
             min_absolute_spread=2.0,
-            quote_size=10,
+            quote_size_dollars=5.0,
             time_normalization_sec=86400.0,
             debounce_cents=2,
             debounce_seconds=5.0,
@@ -53,7 +53,7 @@ class TestIntegration:
     @pytest.fixture
     def execution(self, connector):
         # Disable min_join_depth for tests (otherwise quotes at prices without depth are skipped)
-        config = StrategyConfig(min_join_depth=0)
+        config = StrategyConfig(min_join_depth_dollars=0)
         return ExecutionEngine(config, connector)
 
     @pytest.mark.asyncio
@@ -305,8 +305,8 @@ class TestV2Integration:
             bailout_threshold=1,
         )
         strategy_cfg = StrategyConfig(
-            max_inventory=500,
-            max_order_size=100,
+            max_inventory_dollars=250.0,  # 500 contracts at 50c
+            max_order_size_dollars=50.0,  # 100 contracts at 50c
         )
         return ImpulseEngine(impulse_cfg, risk_cfg, strategy_cfg)
 
@@ -319,8 +319,8 @@ class TestV2Integration:
             reload_threshold=0.8,
         )
         strategy_cfg = StrategyConfig(
-            max_order_size=100,
-            max_inventory=500,
+            max_order_size_dollars=50.0,  # 100 contracts at 50c
+            max_inventory_dollars=250.0,  # 500 contracts at 50c
         )
         return PeggedStrategy(pegged_cfg, strategy_cfg)
 
@@ -357,7 +357,7 @@ class TestV2Integration:
     @pytest.mark.asyncio
     async def test_impulse_hard_limit_fires(self, impulse_engine):
         """Test that impulse engine fires on hard limit breach."""
-        # max_inventory=500, hard_stop_ratio=1.2, so hard_stop=600
+        # max_inventory_dollars=250 at 50c = 500 contracts, hard_stop_ratio=1.2, so hard_stop=600
         action = impulse_engine.check_bailout(
             inventory=700,  # Way over limit
             reservation_price=50.0,

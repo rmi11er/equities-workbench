@@ -102,10 +102,11 @@ class ImpulseEngine:
         self.strategy_config = strategy_config
         self.ofi_tracker = OFITracker(window_sec=impulse_config.ofi_window_sec)
 
-        # Computed limits
-        self._hard_stop_inventory = risk_config.get_hard_stop_inventory(
-            strategy_config.max_inventory
-        )
+        # Computed limits - using dollar-based max_inventory converted at mid=50 (reasonable default)
+        # This will be recalculated dynamically when checking hard limits
+        self._max_inventory_dollars = strategy_config.max_inventory_dollars
+        default_max_inv_contracts = int(self._max_inventory_dollars / 0.50)  # At 50c mid
+        self._hard_stop_inventory = risk_config.get_hard_stop_inventory(default_max_inv_contracts)
 
     @property
     def enabled(self) -> bool:
@@ -183,7 +184,11 @@ class ImpulseEngine:
             return None
 
         # Calculate how much to dump to get back to max_inventory
-        max_inv = self.strategy_config.max_inventory
+        # Convert max_inventory from dollars to contracts at current mid price
+        mid_price = 50.0  # Default
+        if best_bid is not None and best_ask is not None:
+            mid_price = (best_bid + best_ask) / 2.0
+        max_inv = int(self._max_inventory_dollars / (mid_price / 100)) if mid_price > 0 else 1000
         excess = abs_inv - max_inv
 
         if inventory > 0:

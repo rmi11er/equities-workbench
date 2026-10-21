@@ -21,11 +21,10 @@ def sample_config():
         ),
         strategy=StrategyConfig(
             risk_aversion=0.05,
-            time_horizon=1.0,
-            max_inventory=500,
-            max_order_size=100,
+            max_inventory_dollars=250.0,  # 500 contracts at 50c
+            max_order_size_dollars=50.0,  # 100 contracts at 50c
             base_spread=2.0,
-            quote_size=10,
+            quote_size_dollars=5.0,
             debounce_cents=2,
             debounce_seconds=5.0,
         ),

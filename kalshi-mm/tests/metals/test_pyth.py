@@ -1,6 +1,10 @@
 import pytest
 
-from src.metals.pyth import PythAccessError, normalize_tradingview_history
+from src.metals.pyth import (
+    PYTH_GENERIC_PROXY_SYMBOLS,
+    PythAccessError,
+    normalize_tradingview_history,
+)
 
 
 def test_normalize_pyth_history_preserves_decimal_text_and_marks_semantics_unconfirmed():
@@ -30,3 +34,11 @@ def test_normalize_pyth_history_rejects_misaligned_arrays():
             "Metal.Index.SILVER/USD",
             receive_ts_ns=999,
         )
+
+
+def test_generic_proxy_symbols_are_distinct_from_settlement_indices():
+    assert PYTH_GENERIC_PROXY_SYMBOLS == {
+        "silver": "Metal.XAG/USD",
+        "gold": "Metal.XAU/USD",
+    }
+    assert all(".Index." not in value for value in PYTH_GENERIC_PROXY_SYMBOLS.values())

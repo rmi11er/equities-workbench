@@ -1,0 +1,70 @@
+# Passive Market Maker v3
+# Simple, defensive liquidity provision
+
+environment = "production"
+
+market_tickers = [
+    "KXNFLNFCCHAMP-25-SEA",
+    "KXNFLAFCCHAMP-25-BUF",
+    "KXNFLAFCCHAMP-25-NE",
+    "KXNFLNFCCHAMP-25-PHI",
+    "KXNFLAFCCHAMP-25-DEN",
+    "KXNFLAFCCHAMP-25-JAC",
+    "KXNFLNFCCHAMP-25-LA",
+    "KXNFLAFCCHAMP-25-HOU",
+    "KXNFLMVP-26-MSTA",
+    "KXNFLMVP-26-DMAY",
+    "KXNFLCOTY-26-MVRA",
+    "KXNFLCOTY-26-MMAC",
+    "KXNFLGAME-26JAN10GBCHI-CHI",
+    "KXNFLGAME-26JAN10GBCHI-GB",
+    "KXNFLSPREAD-26JAN10GBCHI-GB2",
+    "KXNFLSPREAD-26JAN10GBCHI-CHI2",
+    "KXNFLTOTAL-26JAN10GBCHI-46",
+    "KXNFLGAME-26JAN10LACAR-CAR",
+    "KXNFLGAME-26JAN10LACAR-LA",
+    "KXNFLSPREAD-26JAN10LACAR-LA10",
+    "KXNFLSPREAD-26JAN10LACAR-LA9",
+    "KXNFLTOTAL-26JAN10LACAR-46",
+    "KXNFLGAME-26JAN11BUFJAC-JAC",
+    "KXNFLGAME-26JAN11BUFJAC-BUF",
+    "KXNFLSPREAD-26JAN11BUFJAC-BUF2",
+    "KXNFLSPREAD-26JAN11BUFJAC-JAC2",
+    "KXNFLTOTAL-26JAN11BUFJAC-51",
+    "KXNFLGAME-26JAN11LACNE-NE",
+    "KXNFLGAME-26JAN11LACNE-LAC",
+    "KXNFLSPREAD-26JAN11LACNE-NE3",
+    "KXNFLSPREAD-26JAN11LACNE-NE2",
+    "KXNFLTOTAL-26JAN11LACNE-45",
+    "KXNFLGAME-26JAN11SFPHI-SF",
+    "KXNFLGAME-26JAN11SFPHI-PHI",
+    "KXNFLSPREAD-26JAN11SFPHI-PHI3",
+    "KXNFLSPREAD-26JAN11SFPHI-PHI6",
+    "KXNFLTOTAL-26JAN11SFPHI-43",
+    "KXNFLGAME-26JAN12HOUPIT-PIT",
+    "KXNFLGAME-26JAN12HOUPIT-HOU",
+    "KXNFLSPREAD-26JAN12HOUPIT-HOU3",
+    "KXNFLSPREAD-26JAN12HOUPIT-HOU2",
+    "KXNFLTOTAL-26JAN12HOUPIT-39",
+]
+
+[credentials]
+api_key_id = "your-api-key-id"
+private_key_path = "~/.rsa/private-key.pem"
+
+[quoting]
+min_market_width = 2            # Only quote if BBO spread >= this (cents)
+min_join_depth_dollars = 500    # Hide behind this much cumulative depth ($)
+min_edge_for_reduce = 1         # Can be alone on inventory-reducing side if edge >= this
+
+[sizing]
+quote_size_dollars = 30         # Base quote size in dollars
+max_order_size_dollars = 30     # Fat finger protection per order
+max_inventory_dollars = 30      # Per-market exposure limit
+
+[inventory]
+gamma = 0.01                    # Fade intensity: reservation = mid - q * gamma * sigma^2
+
+[logging]
+log_level = "INFO"
+base_log_dir = "logs"

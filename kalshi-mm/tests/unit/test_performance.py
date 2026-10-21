@@ -85,11 +85,11 @@ class TestStrategyPerformance:
     def stoikov(self):
         config = StrategyConfig(
             risk_aversion=0.05,
-            max_inventory=500,
-            max_order_size=100,
+            max_inventory_dollars=250.0,  # 500 contracts at 50c
+            max_order_size_dollars=50.0,  # 100 contracts at 50c
             base_spread=2.0,
             min_absolute_spread=2.0,
-            quote_size=10,
+            quote_size_dollars=5.0,
         )
         return StoikovStrategy(config)
 
@@ -101,7 +101,7 @@ class TestStrategyPerformance:
             max_exposure=2000,
             reload_threshold=0.8,
         )
-        strategy_cfg = StrategyConfig(max_order_size=100)
+        strategy_cfg = StrategyConfig(max_order_size_dollars=50.0)  # 100 contracts at 50c
         return PeggedStrategy(pegged_cfg, strategy_cfg)
 
     def test_stoikov_generate_quotes_latency(self, stoikov):
@@ -140,7 +140,7 @@ class TestImpulsePerformance:
             ofi_threshold=500,
         )
         risk_cfg = RiskConfig(hard_stop_ratio=1.2, bailout_threshold=1)
-        strategy_cfg = StrategyConfig(max_inventory=500)
+        strategy_cfg = StrategyConfig(max_inventory_dollars=250.0)  # 500 contracts at 50c
         return ImpulseEngine(impulse_cfg, risk_cfg, strategy_cfg)
 
     def test_check_bailout_latency(self, engine):

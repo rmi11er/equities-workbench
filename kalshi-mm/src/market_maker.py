@@ -115,6 +115,9 @@ class MarketMaker:
         # Start connector
         await self.connector.start()
 
+        # Load existing position from exchange
+        await self._load_position()
+
         # CRITICAL: Cancel any stale orders from previous runs
         logger.info(f"Cancelling any stale orders for {self.ticker}...")
         await self._cancel_stale_orders()
@@ -204,6 +207,39 @@ class MarketMaker:
             logger.exception(f"Market maker error: {e}")
         finally:
             await self.stop()
+
+    async def _load_position(self) -> None:
+        """Load existing position from exchange on startup."""
+        try:
+            resp = await self.connector.get_positions()
+            positions = resp.get("market_positions", [])
+
+            for pos in positions:
+                if pos.get("ticker") != self.ticker:
+                    continue
+
+                # Parse position data
+                # Kalshi returns: position (net contracts, + for yes, - for no)
+                net_pos = pos.get("position", 0)
+
+                if net_pos >= 0:
+                    self._position.yes_contracts = net_pos
+                    self._position.no_contracts = 0
+                else:
+                    self._position.yes_contracts = 0
+                    self._position.no_contracts = abs(net_pos)
+
+                if net_pos != 0:
+                    logger.info(
+                        f"[{self.ticker}] Loaded position: {net_pos} contracts "
+                        f"(${abs(net_pos) * 0.50:.0f} @ 50c)"
+                    )
+                return
+
+            logger.info(f"[{self.ticker}] No existing position found")
+
+        except Exception as e:
+            logger.error(f"Failed to load position: {e}")
 
     async def _cancel_stale_orders(self) -> None:
         """Cancel any stale orders from previous runs.
@@ -443,14 +479,16 @@ class MarketMaker:
         new_bid_size = quotes.bid_size
         new_ask_size = quotes.ask_size
 
-        # Ensure minimum size
-        new_bid_size = max(new_bid_size, constraints.min_size)
-        new_ask_size = max(new_ask_size, constraints.min_size)
+        # Ensure minimum size (only if configured to enforce)
+        if self.config.lip.enforce_min_size:
+            new_bid_size = max(new_bid_size, constraints.min_size)
+            new_ask_size = max(new_ask_size, constraints.min_size)
 
-        # Cap at max order size
-        max_size = self.config.strategy.max_order_size
-        new_bid_size = min(new_bid_size, max_size)
-        new_ask_size = min(new_ask_size, max_size)
+        # Convert max order size from dollars to contracts at current prices
+        max_bid_contracts = int(self.config.strategy.max_order_size_dollars / (new_bid_price / 100)) if new_bid_price > 0 else 100
+        max_ask_contracts = int(self.config.strategy.max_order_size_dollars / (new_ask_price / 100)) if new_ask_price > 0 else 100
+        new_bid_size = min(new_bid_size, max_bid_contracts)
+        new_ask_size = min(new_ask_size, max_ask_contracts)
 
         # Ensure within max_distance of best price (if best exists)
         if best_bid is not None:
@@ -669,11 +707,13 @@ class MarketMaker:
             else:
                 # Use Stoikov Strategy with Effective Depth Pricing
                 if liq_metrics.is_empty:
+                    # Empty book: use max order size in dollars, convert at mid=50
+                    empty_book_size = int(self.config.strategy.max_order_size_dollars / 0.50)
                     quotes = StrategyOutput(
                         bid_price=1,
                         ask_price=99,
-                        bid_size=self.config.strategy.max_order_size,
-                        ask_size=self.config.strategy.max_order_size,
+                        bid_size=empty_book_size,
+                        ask_size=empty_book_size,
                         reservation_price=50.0,
                         spread=98.0,
                         inventory_skew=0.0,
@@ -705,9 +745,11 @@ class MarketMaker:
                     new_bid_size = max(1, int(quotes.bid_size * adaptive.size_multiplier))
                     new_ask_size = max(1, int(quotes.ask_size * adaptive.size_multiplier))
 
-                    max_size = self.config.strategy.max_order_size
-                    new_bid_size = min(new_bid_size, max_size)
-                    new_ask_size = min(new_ask_size, max_size)
+                    # Convert max order size from dollars to contracts at current prices
+                    max_bid_contracts = int(self.config.strategy.max_order_size_dollars / (new_bid / 100)) if new_bid > 0 else 100
+                    max_ask_contracts = int(self.config.strategy.max_order_size_dollars / (new_ask / 100)) if new_ask > 0 else 100
+                    new_bid_size = min(new_bid_size, max_bid_contracts)
+                    new_ask_size = min(new_ask_size, max_ask_contracts)
 
                     quotes = StrategyOutput(
                         bid_price=new_bid,
@@ -719,7 +761,7 @@ class MarketMaker:
                         inventory_skew=quotes.inventory_skew,
                     )
 
-                should_bid, should_ask = self.strategy.should_quote(inventory)
+                should_bid, should_ask = self.strategy.should_quote(inventory, mid_price=effective_mid)
         latency_tracker.record_strategy_calc(t.elapsed_us)
 
         # Store reservation price for next impulse check

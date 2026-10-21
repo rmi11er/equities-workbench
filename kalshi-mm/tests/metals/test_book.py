@@ -48,6 +48,28 @@ def test_invalidated_book_does_not_apply_deltas_until_snapshot():
     assert book.state_hash() != original_hash  # validity is part of replay state
 
 
+def test_locked_book_remains_reconstructable_but_crossed_book_is_invalid():
+    book = FixedPointOrderBook("KXSILVER15M-TEST")
+    book.apply_snapshot(
+        {
+            "yes_dollars_fp": [["0.7000", "10"]],
+            "no_dollars_fp": [["0.3000", "10"]],
+        },
+        "locked",
+    )
+    assert book.valid is True
+    assert book.best_yes_bid() == book.best_yes_ask()
+
+    book.apply_snapshot(
+        {
+            "yes_dollars_fp": [["0.7100", "10"]],
+            "no_dollars_fp": [["0.3000", "10"]],
+        },
+        "crossed",
+    )
+    assert book.valid is False
+
+
 def test_replay_is_deterministic():
     events = [
         ("snapshot", SNAPSHOT),

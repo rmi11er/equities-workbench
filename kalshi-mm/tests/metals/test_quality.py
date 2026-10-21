@@ -14,6 +14,7 @@ def test_quality_report_fails_closed_when_sources_are_unmeasured():
         "pyth_coverage",
         "cme_coverage",
         "clock_health",
+        "causal_receive_order",
     }
 
 
@@ -26,6 +27,7 @@ def test_quality_report_passes_only_with_all_specified_data_gates():
     quality.record_source_coverage("cme", valid_ns=995, total_ns=1000)
     quality.record_clock_offset(-250)
     quality.record("clock_error_within_edge_half_life")
+    quality.record("causal_ordering_checked")
     quality.record("metadata_rules_validated")
     quality.record("fee_registry_validated")
     quality.record("incentive_registry_validated")
@@ -47,6 +49,7 @@ def test_unclassified_missing_interval_and_rule_change_fail_gates():
         },
         "missing_intervals": [{"reason": ""}],
         "clock_error_within_edge_half_life": True,
+        "causal_ordering_checked": True,
         "unresolved_metadata_change": True,
         "fee_changes": 1,
         "incentive_changes": 0,
@@ -71,6 +74,56 @@ def test_known_gap_cannot_pass_without_a_classified_interval():
     gate = report["data_gates"]["gates"]["missing_intervals_classified"]
     assert gate["passed"] is False
     assert gate["observed"]["known_gap_events"] == 1
+
+
+def test_settlement_gate_counts_only_usable_and_requires_all_windows_resolved():
+    report = {
+        "expected_windows": 2,
+        "settlement_checksum": {
+            "expected": 2,
+            "checked": 1,
+            "agreements": 1,
+            "disagreements": 0,
+            "excluded": 1,
+            "resolved": 2,
+            "complete": True,
+        },
+    }
+
+    gate = evaluate_data_gates(report)["gates"]["settlement_agreement"]
+    assert gate["passed"] is True
+    assert gate["required"]["minimum_checked"] == 1
+
+    report["settlement_checksum"]["resolved"] = 1
+    assert (
+        evaluate_data_gates(report)["gates"]["settlement_agreement"]["passed"] is False
+    )
+
+
+def test_all_live_ingestion_gap_counters_require_classified_intervals():
+    counter_names = (
+        "pyth_gap_events",
+        "pyth_transport_disconnects",
+        "cme_disconnects",
+        "cme_normalization_queue_overflows",
+        "ingestion_monotonic_regressions",
+    )
+    quality = QualityTracker()
+    for counter in counter_names:
+        quality.record(counter)
+
+    unclassified = quality.report("2026-08-29", "gap-run")
+    gate = unclassified["data_gates"]["gates"]["missing_intervals_classified"]
+    assert gate["passed"] is False
+    assert gate["observed"]["known_gap_events"] == len(counter_names)
+
+    for index, counter in enumerate(counter_names):
+        quality.record_missing_interval("test", index, index, counter)
+    classified = quality.report("2026-08-29", "gap-run")
+    assert (
+        classified["data_gates"]["gates"]["missing_intervals_classified"]["passed"]
+        is True
+    )
 
 
 def test_invalid_coverage_and_empty_exclusion_reason_are_rejected():

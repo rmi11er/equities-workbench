@@ -57,6 +57,8 @@ RULE_FIELDS = (
     "strike_type",
     "settlement_source_name",
     "settlement_source_url",
+    "rules_primary",
+    "rules_secondary",
     "pyth_symbol",
     "pyth_feed_id",
     "price_level_structure",
@@ -103,9 +105,7 @@ def normalize_market_metadata(
         "event_ticker": event_ticker,
         "series_ticker": series_ticker,
         "metal": metal,
-        "open_ts_ns": iso8601_to_ns(
-            _first(raw, "open_time", "open_ts", "start_time")
-        ),
+        "open_ts_ns": iso8601_to_ns(_first(raw, "open_time", "open_ts", "start_time")),
         "close_ts_ns": iso8601_to_ns(
             _first(raw, "close_time", "expiration_time", "close_ts")
         ),
@@ -136,6 +136,8 @@ def normalize_market_metadata(
         "settlement_source_url": _string(
             _first(raw, "settlement_source_url", "settlement_url")
         ),
+        "rules_primary": _string(raw.get("rules_primary")),
+        "rules_secondary": _string(raw.get("rules_secondary")),
         "pyth_symbol": _string(_first(raw, "pyth_symbol", "price_source_symbol")),
         "pyth_feed_id": _string(_first(raw, "pyth_feed_id", "price_source_id")),
         "price_level_structure": _string(
@@ -163,6 +165,8 @@ def normalize_market_metadata(
         "strike_type": values["strike_type"],
         "settlement_source_name": values["settlement_source_name"],
         "settlement_source_url": values["settlement_source_url"],
+        "rules_primary": values["rules_primary"],
+        "rules_secondary": values["rules_secondary"],
         "price_level_structure": values["price_level_structure"],
         "fractional_enabled": values["fractional_enabled"],
     }

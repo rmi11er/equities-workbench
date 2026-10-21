@@ -140,3 +140,46 @@ def test_catalog_deduplicates_repeated_runs_and_retains_provenance(tmp_path):
         assert connection.execute(
             "SELECT count(*) FROM kalshi_settlement_all_runs"
         ).fetchone() == (2,)
+
+
+def test_catalog_stabilizes_nullable_market_metadata_types_across_segments(tmp_path):
+    _write_normalized(
+        tmp_path,
+        "market_dim",
+        "null-segment",
+        [
+            {
+                "market_ticker": "SILVER-NULL",
+                "metadata_version": 1,
+                "metadata_receive_ts_ns": 100,
+                "pyth_symbol": None,
+                "pyth_feed_id": None,
+            }
+        ],
+    )
+    _write_normalized(
+        tmp_path,
+        "market_dim",
+        "string-segment",
+        [
+            {
+                "market_ticker": "SILVER-STRING",
+                "metadata_version": 1,
+                "metadata_receive_ts_ns": 200,
+                "pyth_symbol": "Metal.Index.SILVER/USD",
+                "pyth_feed_id": "feed-id",
+            }
+        ],
+    )
+
+    export_normalized_parquet(tmp_path)
+    catalog = build_duckdb_catalog(tmp_path)
+
+    with duckdb.connect(str(catalog), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT market_ticker, pyth_symbol, pyth_feed_id FROM market_dim "
+            "ORDER BY market_ticker"
+        ).fetchall() == [
+            ("SILVER-NULL", None, None),
+            ("SILVER-STRING", "Metal.Index.SILVER/USD", "feed-id"),
+        ]

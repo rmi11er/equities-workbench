@@ -20,11 +20,12 @@ from .kalshi import (
     KalshiWebSocketReader,
     ReceivedResponse,
 )
+from .ingestion import GlobalReceiveSequencer
 from .metadata import MetadataRegistry
 from .quality import QualityTracker
 from .storage import PartitionedRawStore, update_run_manifest, write_run_manifest
 from .timeutil import iso8601_to_ns
-from .types import SequenceStatus, SourceEnvelope
+from .types import MarketMetadataVersion, SequenceStatus, SourceEnvelope
 
 
 logger = logging.getLogger(__name__)
@@ -53,11 +54,32 @@ def _extract_series_source(series: Dict[str, Any]) -> Tuple[Optional[str], Optio
     return None, None
 
 
+def _completed_trade_markets(root: Path) -> Set[str]:
+    """Return markets whose public trade pagination completed durably."""
+
+    completed: Set[str] = set()
+    request_root = Path(root) / "normalized" / "kalshi_trade_request"
+    for path in sorted(request_root.glob("**/*.jsonl")):
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                ticker = str(row.get("market_ticker", ""))
+                if ticker and row.get("status") == "completed":
+                    completed.add(ticker)
+    return completed
+
+
 class MetalsRecorder:
     """Record target-market data without exposing any order-entry operation."""
 
-    def __init__(self, config: MetalsConfig, require_credentials: bool = True) -> None:
+    def __init__(
+        self,
+        config: MetalsConfig,
+        require_credentials: bool = True,
+        sequencer: Optional[GlobalReceiveSequencer] = None,
+    ) -> None:
         self.config = config
+        self.sequencer = sequencer or GlobalReceiveSequencer()
         try:
             self.credentials = resolve_kalshi_credentials(config.kalshi)
         except (ValueError, FileNotFoundError):
@@ -80,19 +102,31 @@ class MetalsRecorder:
         self.metadata = MetadataRegistry(
             fractional_capability=config.kalshi.fractional_contracts_enabled
         )
+        self.market_versions: Dict[str, MarketMetadataVersion] = {}
         self.books: Dict[str, FixedPointOrderBook] = {}
         self._market_metal: Dict[str, str] = {}
         self._market_raw: Dict[str, Dict[str, Any]] = {}
         self._desired_tickers: Set[str] = set()
         self._ticker_change = asyncio.Event()
         self._stop = asyncio.Event()
-        self._ingestion_sequence = 0
         self._series_cache: Dict[str, Dict[str, Any]] = {}
         self._event_metadata_cache: Dict[str, Dict[str, Any]] = {}
+        self._active_ws_connection_id: Optional[str] = None
+        self._last_disconnected_connection_id: Optional[str] = None
+        self._pending_ws_gaps: List[Dict[str, Any]] = []
+        self._ws_attempt_number = 0
         self._finalized = False
-        self._client = KalshiReadClient(config.kalshi, self.credentials)
+        self._client = KalshiReadClient(
+            config.kalshi,
+            self.credentials,
+            sequencer=self.sequencer,
+        )
         self._ws = (
-            KalshiWebSocketReader(config.kalshi, self.credentials)
+            KalshiWebSocketReader(
+                config.kalshi,
+                self.credentials,
+                sequencer=self.sequencer,
+            )
             if self.credentials is not None
             else None
         )
@@ -101,11 +135,32 @@ class MetalsRecorder:
         )
 
     def _next_ingestion_sequence(self) -> int:
-        self._ingestion_sequence += 1
-        return self._ingestion_sequence
+        return self.sequencer.stamp("kalshi", "derived").ingestion_sequence
 
     def _write_raw_envelope(self, envelope: SourceEnvelope, metal: str) -> None:
-        envelope.ingestion_sequence = self._next_ingestion_sequence()
+        # Live readers stamp at their receive boundary. Historical/injected
+        # envelopes without a stamp are assigned exactly once here.
+        if envelope.ingestion_sequence <= 0:
+            stamp = self.sequencer.stamp(
+                envelope.source,
+                envelope.stream,
+                receive_ts_ns=envelope.receive_ts_ns,
+                local_monotonic_ts_ns=envelope.local_monotonic_ts_ns,
+            )
+            envelope.ingestion_sequence = stamp.ingestion_sequence
+            envelope.receive_ts_ns = stamp.receive_ts_ns
+            envelope.local_monotonic_ts_ns = stamp.local_monotonic_ts_ns
+            envelope.previous_monotonic_ts_ns = stamp.previous_monotonic_ts_ns
+            envelope.monotonic_regression = stamp.monotonic_regression
+        if envelope.monotonic_regression:
+            self.quality.record("ingestion_monotonic_regressions")
+            self.quality.record_missing_interval(
+                "kalshi",
+                envelope.receive_ts_ns,
+                envelope.receive_ts_ns,
+                "global_monotonic_regression",
+                ticker=_message_ticker(envelope.raw.get("msg", {})),
+            )
         self.raw_store.write(
             source=envelope.source,
             stream=envelope.stream,
@@ -130,6 +185,143 @@ class MetalsRecorder:
             record=record,
         )
 
+    def _transport_storage_metal(self) -> str:
+        enabled = sorted(self.config.enabled_products)
+        return enabled[0] if len(enabled) == 1 else "unclassified"
+
+    def _write_transport_event(
+        self,
+        event_type: str,
+        *,
+        receive_ts_ns: Optional[int] = None,
+        local_monotonic_ts_ns: Optional[int] = None,
+        ingestion_sequence: Optional[int] = None,
+        **fields: Any,
+    ) -> Dict[str, Any]:
+        if (
+            receive_ts_ns is None
+            or local_monotonic_ts_ns is None
+            or ingestion_sequence is None
+        ):
+            stamp = self.sequencer.stamp("kalshi", "transport")
+            receive_ts_ns = stamp.receive_ts_ns
+            local_monotonic_ts_ns = stamp.local_monotonic_ts_ns
+            ingestion_sequence = stamp.ingestion_sequence
+        record = {
+            "event_type": event_type,
+            "receive_ts_ns": receive_ts_ns,
+            "local_monotonic_ts_ns": local_monotonic_ts_ns,
+            "ingestion_sequence": ingestion_sequence,
+            **fields,
+        }
+        self._write_normalized(
+            "kalshi_transport_event",
+            self._transport_storage_metal(),
+            receive_ts_ns,
+            record,
+        )
+        return record
+
+    @staticmethod
+    def _websocket_error_details(error: Optional[BaseException]) -> Dict[str, Any]:
+        if error is None:
+            return {
+                "error_type": "UnexpectedWebSocketEnd",
+                "error_module": None,
+                "received_close_code": None,
+                "received_close_reason": None,
+                "sent_close_code": None,
+                "sent_close_reason": None,
+            }
+
+        def close_field(frame_name: str, field_name: str) -> Any:
+            frame = getattr(error, frame_name, None)
+            value = getattr(frame, field_name, None)
+            if field_name == "reason" and value is not None:
+                # Close reasons are remote-controlled. Retain printable diagnostic
+                # content without persisting control characters or unbounded text.
+                value = "".join(
+                    character for character in str(value) if character.isprintable()
+                )[:160]
+            return value
+
+        return {
+            "error_type": type(error).__name__,
+            "error_module": type(error).__module__,
+            "received_close_code": close_field("rcvd", "code"),
+            "received_close_reason": close_field("rcvd", "reason"),
+            "sent_close_code": close_field("sent", "code"),
+            "sent_close_reason": close_field("sent", "reason"),
+        }
+
+    def _record_websocket_disconnect(
+        self, error: Optional[BaseException]
+    ) -> Dict[str, Any]:
+        details = self._websocket_error_details(error)
+        event = self._write_transport_event(
+            "disconnected",
+            connection_id=self._active_ws_connection_id,
+            attempt_number=self._ws_attempt_number,
+            **details,
+        )
+        disconnect_ts_ns = int(event["receive_ts_ns"])
+        interval = self.quality.record_missing_interval(
+            "kalshi",
+            disconnect_ts_ns,
+            None,
+            "websocket_disconnect",
+            details={
+                "connection_id": self._active_ws_connection_id,
+                "attempt_number": self._ws_attempt_number,
+                **details,
+            },
+        )
+        self._pending_ws_gaps.append(interval)
+        self._last_disconnected_connection_id = self._active_ws_connection_id
+        self.quality.record("websocket_disconnects")
+        return event
+
+    def _observe_ws_connection(self, envelope: SourceEnvelope) -> None:
+        connection_id = envelope.connection_id
+        if not connection_id or connection_id == self._active_ws_connection_id:
+            return
+
+        previous_connection_id = self._active_ws_connection_id
+        recovered = list(self._pending_ws_gaps)
+        for interval in recovered:
+            interval["end_ts_ns"] = envelope.receive_ts_ns
+            interval["duration_ns"] = max(
+                0, envelope.receive_ts_ns - int(interval["start_ts_ns"])
+            )
+        outage_start_ts_ns = (
+            min(int(interval["start_ts_ns"]) for interval in recovered)
+            if recovered
+            else None
+        )
+        event_type = "reconnected" if recovered else "connection_ready"
+        self._write_transport_event(
+            event_type,
+            receive_ts_ns=envelope.receive_ts_ns,
+            local_monotonic_ts_ns=envelope.local_monotonic_ts_ns,
+            ingestion_sequence=envelope.ingestion_sequence,
+            connection_id=connection_id,
+            previous_connection_id=(
+                self._last_disconnected_connection_id or previous_connection_id
+            ),
+            attempt_number=self._ws_attempt_number,
+            outage_start_ts_ns=outage_start_ts_ns,
+            outage_duration_ns=(
+                envelope.receive_ts_ns - outage_start_ts_ns
+                if outage_start_ts_ns is not None
+                else None
+            ),
+            disconnect_events_recovered=len(recovered),
+        )
+        if recovered:
+            self.quality.record("websocket_reconnects")
+        self._pending_ws_gaps.clear()
+        self._active_ws_connection_id = connection_id
+
     def _metal_for_message(self, message: Dict[str, Any]) -> Optional[str]:
         ticker = _message_ticker(message)
         if ticker in self._market_metal:
@@ -150,17 +342,26 @@ class MetalsRecorder:
     def _rest_envelope(
         self, response: ReceivedResponse, stream: str
     ) -> SourceEnvelope:
+        stamp = response.receive_stamp
         return SourceEnvelope(
             source="kalshi",
             stream=stream,
-            ingestion_sequence=0,
-            local_monotonic_ts_ns=response.local_monotonic_ts_ns,
-            receive_ts_ns=response.receive_ts_ns,
+            ingestion_sequence=(stamp.ingestion_sequence if stamp else 0),
+            local_monotonic_ts_ns=(
+                stamp.local_monotonic_ts_ns
+                if stamp
+                else response.local_monotonic_ts_ns
+            ),
+            receive_ts_ns=(stamp.receive_ts_ns if stamp else response.receive_ts_ns),
             raw={
                 "path": response.path,
                 "params": response.params,
             },
             raw_text=response.raw_body,
+            previous_monotonic_ts_ns=(
+                stamp.previous_monotonic_ts_ns if stamp else None
+            ),
+            monotonic_regression=(stamp.monotonic_regression if stamp else False),
         )
 
     async def _get_series(self, series_ticker: str, metal: str) -> Dict[str, Any]:
@@ -274,6 +475,7 @@ class MetalsRecorder:
             version, changed = self.metadata.observe(
                 market, metal=item.metal, receive_ts_ns=time.time_ns()
             )
+            self.market_versions[ticker] = version
             if changed:
                 self._write_normalized(
                     "market_dim",
@@ -440,6 +642,7 @@ class MetalsRecorder:
         self.quality.record("kalshi_pyth_values")
 
     async def _process_ws(self, envelope: SourceEnvelope) -> None:
+        self._observe_ws_connection(envelope)
         message = envelope.raw.get("msg", {})
         if not isinstance(message, dict):
             message = {"value": message}
@@ -459,6 +662,13 @@ class MetalsRecorder:
             return
         if envelope.gap_flag:
             self.quality.record("kalshi_sequence_gaps", ticker)
+            self.quality.record_missing_interval(
+                "kalshi",
+                envelope.receive_ts_ns,
+                None,
+                "kalshi_sequence_gap",
+                ticker=ticker or None,
+            )
             if ticker and ticker in self.books:
                 self.books[ticker].invalidate()
             return
@@ -496,7 +706,11 @@ class MetalsRecorder:
     async def _websocket_supervisor(self) -> None:
         reconnect_backoff = 1.0
         while not self._stop.is_set():
-            if not self._desired_tickers:
+            has_pyth_underlying = any(
+                product.pyth_symbol
+                for product in self.config.enabled_products.values()
+            )
+            if not self._desired_tickers and not has_pyth_underlying:
                 self._ticker_change.clear()
                 try:
                     await asyncio.wait_for(self._ticker_change.wait(), timeout=1.0)
@@ -507,6 +721,21 @@ class MetalsRecorder:
             tickers = sorted(self._desired_tickers)
             self._ticker_change.clear()
             connection_stop = asyncio.Event()
+            self._ws_attempt_number += 1
+            self._write_transport_event(
+                "connection_attempt_started",
+                connection_id=None,
+                previous_connection_id=self._active_ws_connection_id,
+                attempt_number=self._ws_attempt_number,
+                subscribed_market_tickers=tickers,
+                subscribed_pyth_underlyings=sorted(
+                    {
+                        product.pyth_symbol
+                        for product in self.config.enabled_products.values()
+                        if product.pyth_symbol
+                    }
+                ),
+            )
             consume = asyncio.create_task(self._consume_ws(tickers, connection_stop))
             changed = asyncio.create_task(self._ticker_change.wait())
             stopped = asyncio.create_task(self._stop.wait())
@@ -516,11 +745,13 @@ class MetalsRecorder:
             connection_stop.set()
             for task in pending:
                 task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             if consume in done:
                 error = consume.exception()
-                if error is not None and not self._stop.is_set():
+                if not self._stop.is_set():
                     logger.warning("Kalshi WebSocket disconnected: %s", error)
-                    self.quality.record("websocket_disconnects")
+                    self._record_websocket_disconnect(error)
                     await asyncio.sleep(reconnect_backoff)
                     reconnect_backoff = min(reconnect_backoff * 2, 30.0)
                     continue
@@ -673,15 +904,46 @@ async def backfill_settled_markets(
     metal: str,
     max_markets: Optional[int] = None,
     include_trades: bool = True,
+    min_close_seconds: Optional[int] = None,
+    max_close_seconds: Optional[int] = None,
+    market_stride: int = 1,
+    market_stride_offset: int = 0,
 ) -> Dict[str, int]:
     """Archive settled market metadata/results and optionally public trades."""
 
     product = config.products.get(metal)
     if product is None or not product.series_tickers:
         raise ValueError("No configured series ticker for {}".format(metal))
+    if min_close_seconds is not None and min_close_seconds < 1:
+        raise ValueError("min_close_seconds must be positive")
+    if max_close_seconds is not None and max_close_seconds < 1:
+        raise ValueError("max_close_seconds must be positive")
+    if (
+        min_close_seconds is not None
+        and max_close_seconds is not None
+        and min_close_seconds > max_close_seconds
+    ):
+        raise ValueError("min_close_seconds cannot exceed max_close_seconds")
+    if market_stride < 1:
+        raise ValueError("market_stride must be positive")
+    if not 0 <= market_stride_offset < market_stride:
+        raise ValueError("market_stride_offset must be within market_stride")
+    if market_stride > 1 and min_close_seconds is None:
+        raise ValueError("market_stride requires min_close_seconds")
 
     recorder = MetalsRecorder(config, require_credentials=False)
-    counts = {"markets": 0, "trades": 0, "pages": 0}
+    completed_trade_markets = (
+        _completed_trade_markets(Path(config.storage.root))
+        if include_trades
+        else set()
+    )
+    counts = {
+        "markets": 0,
+        "trades": 0,
+        "pages": 0,
+        "trade_markets_requested": 0,
+        "trade_markets_skipped": 0,
+    }
     failure: Optional[BaseException] = None
     close_failure: Optional[BaseException] = None
     try:
@@ -689,10 +951,19 @@ async def backfill_settled_markets(
         for series_ticker in product.series_tickers:
             series_metadata = await recorder._get_series(series_ticker, metal)
             source_name, source_url = _extract_series_source(series_metadata)
+            market_params: Dict[str, Any] = {"series_ticker": series_ticker}
+            if min_close_seconds is None and max_close_seconds is None:
+                market_params["status"] = "settled"
+            else:
+                # Kalshi does not allow the settled status filter together with
+                # close-time filters. Pad the public API bounds by one second,
+                # then apply exact inclusive bounds below.
+                if min_close_seconds is not None:
+                    market_params["min_close_ts"] = min_close_seconds - 1
+                if max_close_seconds is not None:
+                    market_params["max_close_ts"] = max_close_seconds + 1
             pages = await recorder._client.get_all_pages(
-                "/markets",
-                "markets",
-                {"series_ticker": series_ticker, "status": "settled"},
+                "/markets", "markets", market_params
             )
             for response in pages:
                 counts["pages"] += 1
@@ -703,13 +974,48 @@ async def backfill_settled_markets(
                     if max_markets is not None and counts["markets"] >= max_markets:
                         break
                     market = dict(market)
+                    close_ts_ns = iso8601_to_ns(
+                        market.get("close_time") or market.get("expiration_time")
+                    )
+                    close_seconds = (
+                        close_ts_ns // 1_000_000_000
+                        if close_ts_ns is not None
+                        else None
+                    )
+                    if (
+                        min_close_seconds is not None
+                        and (
+                            close_seconds is None
+                            or close_seconds < min_close_seconds
+                        )
+                    ):
+                        continue
+                    if (
+                        max_close_seconds is not None
+                        and (
+                            close_seconds is None
+                            or close_seconds > max_close_seconds
+                        )
+                    ):
+                        continue
+                    if str(market.get("result", "")).lower() not in ("yes", "no"):
+                        continue
+                    if market_stride > 1:
+                        assert close_seconds is not None
+                        assert min_close_seconds is not None
+                        slot = (close_seconds - min_close_seconds) // (15 * 60)
+                        if slot % market_stride != market_stride_offset:
+                            continue
                     market.setdefault("series_ticker", series_ticker)
                     if source_name:
                         market["settlement_source_name"] = source_name
                     if source_url:
                         market["settlement_source_url"] = source_url
                     decoded_source_url = urllib.parse.unquote(source_url or "")
-                    if product.pyth_symbol in decoded_source_url:
+                    if (
+                        product.pyth_symbol
+                        and product.pyth_symbol in decoded_source_url
+                    ):
                         market["pyth_symbol"] = product.pyth_symbol
                     ticker = str(market.get("ticker", ""))
                     recorder._market_metal[ticker] = metal
@@ -746,30 +1052,82 @@ async def backfill_settled_markets(
                     recorder.quality.record("observed_windows", ticker)
 
                     if include_trades and ticker:
-                        trade_pages = await recorder._client.get_all_pages(
-                            "/markets/trades", "trades", {"ticker": ticker}
-                        )
-                        for trade_response in trade_pages:
-                            recorder._write_raw_envelope(
-                                recorder._rest_envelope(
-                                    trade_response, "rest_historical_trades"
-                                ),
-                                metal,
+                        if ticker in completed_trade_markets:
+                            counts["trade_markets_skipped"] += 1
+                            continue
+                        counts["trade_markets_requested"] += 1
+                        market_trade_count = 0
+                        try:
+                            trade_pages = await recorder._client.get_all_pages(
+                                "/markets/trades", "trades", {"ticker": ticker}
                             )
-                            for trade in trade_response.payload.get("trades", []):
-                                envelope = SourceEnvelope(
-                                    source="kalshi",
-                                    stream="rest_trade",
-                                    ingestion_sequence=recorder._next_ingestion_sequence(),
-                                    local_monotonic_ts_ns=trade_response.local_monotonic_ts_ns,
-                                    receive_ts_ns=trade_response.receive_ts_ns,
-                                    raw={"type": "trade", "msg": trade},
-                                    source_event_ts_ns=iso8601_to_ns(
-                                        trade.get("ts_ms", trade.get("created_time"))
+                            for trade_response in trade_pages:
+                                recorder._write_raw_envelope(
+                                    recorder._rest_envelope(
+                                        trade_response,
+                                        "rest_historical_trades",
                                     ),
+                                    metal,
                                 )
-                                recorder._record_trade(envelope, metal, trade)
-                                counts["trades"] += 1
+                                trades = trade_response.payload.get("trades", [])
+                                for trade in trades:
+                                    envelope = SourceEnvelope(
+                                        source="kalshi",
+                                        stream="rest_trade",
+                                        ingestion_sequence=(
+                                            recorder._next_ingestion_sequence()
+                                        ),
+                                        local_monotonic_ts_ns=(
+                                            trade_response.local_monotonic_ts_ns
+                                        ),
+                                        receive_ts_ns=trade_response.receive_ts_ns,
+                                        raw={"type": "trade", "msg": trade},
+                                        source_event_ts_ns=iso8601_to_ns(
+                                            trade.get(
+                                                "ts_ms",
+                                                trade.get("created_time"),
+                                            )
+                                        ),
+                                    )
+                                    recorder._record_trade(envelope, metal, trade)
+                                    counts["trades"] += 1
+                                    market_trade_count += 1
+                            request_receive_ts_ns = (
+                                trade_pages[-1].receive_ts_ns
+                                if trade_pages
+                                else response.receive_ts_ns
+                            )
+                            recorder._write_normalized(
+                                "kalshi_trade_request",
+                                metal,
+                                request_receive_ts_ns,
+                                {
+                                    "market_ticker": ticker,
+                                    "series_ticker": series_ticker,
+                                    "trade_count": market_trade_count,
+                                    "receive_ts_ns": request_receive_ts_ns,
+                                    "status": "completed",
+                                },
+                            )
+                            # The marker is the resume boundary. Make both raw
+                            # pages and normalized trades durable before a
+                            # future run is allowed to skip this market.
+                            recorder.raw_store.sync()
+                            recorder.normalized_store.sync()
+                        except BaseException:
+                            recorder._write_normalized(
+                                "kalshi_trade_request",
+                                metal,
+                                response.receive_ts_ns,
+                                {
+                                    "market_ticker": ticker,
+                                    "series_ticker": series_ticker,
+                                    "trade_count": market_trade_count,
+                                    "receive_ts_ns": response.receive_ts_ns,
+                                    "status": "failed",
+                                },
+                            )
+                            raise
                 if max_markets is not None and counts["markets"] >= max_markets:
                     break
     except BaseException as error:

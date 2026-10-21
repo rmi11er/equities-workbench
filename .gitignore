@@ -1,0 +1,37 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs, local data, OS cruft
+*.log
+.DS_Store
+.python-version
+
+# Local tooling
+.claude/
+
+# Side projects and nested repos kept out of this repo
+/bouncer-challenge/
+/citrini-research/
+/comp-prog/
+/crypto/
+/event_analysis/
+/polymarket/
+/walmart-drop-bot/
+/vol-modeling/
+
+# Private documents
+*.docx
+/kalshi-mm/config_v3.toml

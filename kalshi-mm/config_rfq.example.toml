@@ -16,6 +16,12 @@ min_spread_cents = 2         # Minimum spread floor
 max_spread_cents = 15        # Maximum spread cap
 use_bbo_mid = true           # Use BBO mid as primary price source
 
+# Liquidity requirements for considering a leg "priceable"
+# We walk through the orderbook accumulating $ until we hit the target.
+# If the spread at that depth exceeds max, the leg is considered illiquid.
+min_bbo_liquidity_dollars = 10.0  # Min $ required on each side of book
+max_bbo_spread_cents = 20         # Max spread at required depth (0 = no limit)
+
 [risk]
 # Exposure limits
 max_exposure_dollars = 1000.0    # Total $ exposure across all active quotes
@@ -56,9 +62,15 @@ quote_ttl_seconds = 30.0             # How long our quotes are valid
 confirmation_timeout_seconds = 5.0   # Time to confirm after acceptance
 
 # Markets to subscribe for leg pricing (orderbook data)
-# Add all markets that could appear as legs in RFQs you want to quote
+#
+# If empty [], the responder subscribes DYNAMICALLY as RFQs arrive.
+# This works well with allowed_sports filtering - e.g., set allowed_sports = ["NFL"]
+# and leave leg_tickers empty to automatically subscribe to any NFL leg markets.
+#
+# If specified, only these markets will have orderbook data for pricing.
 leg_tickers = [
-    # Example NFL markets
+    # Leave empty for dynamic subscription based on allowed_sports
+    # Or specify markets explicitly:
     # "NFLSB-25-KC",
     # "NFLSB-25-PHI",
 ]

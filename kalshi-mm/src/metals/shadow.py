@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .config import ShadowConfig
 
@@ -105,6 +105,13 @@ class RestingShadowOrder:
     intent: ShadowOrderIntent
     remaining_quantity: Decimal
     remaining_fee_reserve: Decimal
+    # This collection reserves risk for every in-flight order, including ones
+    # that have not reached the simulated exchange yet.
+    state: str = "resting"
+    arrival_ts_ns: Optional[int] = None
+    submit_deadline_monotonic_ns: Optional[int] = None
+    cancel_deadline_monotonic_ns: Optional[int] = None
+    cancel_after_arrival_latency_ns: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +168,7 @@ class ShadowRiskEngine:
         self.resting_orders: Dict[str, RestingShadowOrder] = {}
         self.daily_realized_pnl = ZERO
         self._kill_switches: set = set()
+        self._terminal_quote_ids: set = set()
 
         self._max_order = _decimal(
             config.max_contracts_per_order, "max_contracts_per_order"
@@ -345,10 +353,23 @@ class ShadowRiskEngine:
         )
 
     def place(
-        self, intent: ShadowOrderIntent
+        self,
+        intent: ShadowOrderIntent,
+        *,
+        monotonic_ts_ns: Optional[int] = None,
+        submit_latency_ns: int = 0,
     ) -> Tuple[ShadowRiskDecision, List[ShadowLifecycleEvent]]:
+        """Reserve full order risk before its simulated exchange arrival.
+
+        Legacy zero-latency calls still rest immediately. With latency, callers
+        must advance the lifecycle before matching observed trades. Placement
+        does not backfill trades that occurred before the eventual advance.
+        """
+
+        deadline = self._deadline(monotonic_ts_ns, submit_latency_ns)
         if intent.logical_quote_id in self.resting_orders:
             raise ValueError("logical_quote_id is already resting")
+        self._terminal_quote_ids.discard(intent.logical_quote_id)
         decision = self.assess(intent)
         event_types = ["decision_created"]
         if decision.approved:
@@ -356,12 +377,126 @@ class ShadowRiskEngine:
                 intent=intent,
                 remaining_quantity=intent.quantity,
                 remaining_fee_reserve=intent.worst_case_fee,
+                state="pending_submit" if submit_latency_ns else "resting",
+                arrival_ts_ns=None if submit_latency_ns else intent.decision_ts_ns,
+                submit_deadline_monotonic_ns=deadline if submit_latency_ns else None,
             )
-            event_types.extend(("submit_sent", "submit_acknowledged", "order_resting"))
+            event_types.append("submit_sent")
+            if not submit_latency_ns:
+                event_types.extend(("submit_acknowledged", "order_resting"))
         else:
             event_types.append("risk_rejected")
+            self._terminal_quote_ids.add(intent.logical_quote_id)
         events = [self._event(intent, event_type, intent.quantity) for event_type in event_types]
         return decision, events
+
+    @staticmethod
+    def _deadline(monotonic_ts_ns: Optional[int], latency_ns: int) -> Optional[int]:
+        if not isinstance(latency_ns, int) or latency_ns < 0:
+            raise ValueError("latency_ns must be a nonnegative integer")
+        if monotonic_ts_ns is not None and (
+            not isinstance(monotonic_ts_ns, int) or monotonic_ts_ns < 0
+        ):
+            raise ValueError("monotonic_ts_ns must be a nonnegative integer")
+        if latency_ns and monotonic_ts_ns is None:
+            raise ValueError("Delayed orders require monotonic_ts_ns")
+        return None if monotonic_ts_ns is None else monotonic_ts_ns + latency_ns
+
+    def advance(
+        self,
+        event_ts_ns: int,
+        monotonic_ts_ns: int,
+        can_rest: Callable[[ShadowOrderIntent], bool],
+    ) -> List[ShadowLifecycleEvent]:
+        """Apply due lifecycle transitions against the currently observed book.
+
+        Deadlines use only monotonic time. Arrival is recorded at this observed
+        wall time, rather than backdated into a data or scheduling gap. The
+        callback must reject crossing orders and invalid or unavailable books.
+        This method never infers a fill from intervening unobserved activity.
+        """
+
+        self._deadline(monotonic_ts_ns, 0)
+        if event_ts_ns < 0:
+            raise ValueError("event_ts_ns cannot be negative")
+        due = []
+        for quote_id, order in self.resting_orders.items():
+            if order.submit_deadline_monotonic_ns is not None:
+                due.append((order.submit_deadline_monotonic_ns, 0, quote_id))
+            if order.cancel_deadline_monotonic_ns is not None:
+                due.append((order.cancel_deadline_monotonic_ns, 1, quote_id))
+
+        events: List[ShadowLifecycleEvent] = []
+        for deadline, transition, quote_id in sorted(due):
+            if deadline > monotonic_ts_ns:
+                break
+            order = self.resting_orders.get(quote_id)
+            if order is None:
+                continue
+            if transition == 0:
+                if not can_rest(order.intent):
+                    events.append(
+                        self._event(
+                            order.intent,
+                            "post_only_rejected",
+                            order.remaining_quantity,
+                            event_ts_ns=event_ts_ns,
+                        )
+                    )
+                    del self.resting_orders[quote_id]
+                    self._terminal_quote_ids.add(quote_id)
+                    continue
+                order.submit_deadline_monotonic_ns = None
+                order.arrival_ts_ns = event_ts_ns
+                if order.state != "pending_cancel":
+                    order.state = "resting"
+                for event_type in ("submit_acknowledged", "order_resting"):
+                    events.append(
+                        self._event(
+                            order.intent,
+                            event_type,
+                            order.remaining_quantity,
+                            event_ts_ns=event_ts_ns,
+                        )
+                    )
+                if order.cancel_after_arrival_latency_ns is not None:
+                    order.cancel_deadline_monotonic_ns = (
+                        monotonic_ts_ns + order.cancel_after_arrival_latency_ns
+                    )
+                    order.cancel_after_arrival_latency_ns = None
+                    events.append(
+                        self._event(
+                            order.intent,
+                            "cancel_sent",
+                            order.remaining_quantity,
+                            event_ts_ns=event_ts_ns,
+                        )
+                    )
+                    if order.cancel_deadline_monotonic_ns == monotonic_ts_ns:
+                        events.append(
+                            self._event(
+                                order.intent,
+                                "cancel_acknowledged",
+                                order.remaining_quantity,
+                                event_ts_ns=event_ts_ns,
+                            )
+                        )
+                        del self.resting_orders[quote_id]
+                        self._terminal_quote_ids.add(quote_id)
+            else:
+                if order.cancel_deadline_monotonic_ns != deadline:
+                    continue
+                events.append(
+                    self._event(
+                        order.intent,
+                        "cancel_acknowledged",
+                        order.remaining_quantity,
+                        event_ts_ns=event_ts_ns,
+                    )
+                )
+                del self.resting_orders[quote_id]
+                self._terminal_quote_ids.add(quote_id)
+        return events
 
     def fill(
         self,
@@ -373,6 +508,8 @@ class ShadowRiskEngine:
         order = self.resting_orders.get(logical_quote_id)
         if order is None:
             raise KeyError("Unknown resting shadow order: {}".format(logical_quote_id))
+        if order.arrival_ts_ns is None or event_ts_ns < order.arrival_ts_ns:
+            raise ValueError("Shadow order cannot fill before simulated arrival")
         quantity = _decimal(quantity_fp, "quantity_fp")
         fee = _decimal(fee_dollars, "fee_dollars")
         if quantity <= ZERO or quantity > order.remaining_quantity:
@@ -402,14 +539,42 @@ class ShadowRiskEngine:
         )
         if order.remaining_quantity == ZERO:
             del self.resting_orders[logical_quote_id]
+            self._terminal_quote_ids.add(logical_quote_id)
         return event
 
     def cancel(
-        self, logical_quote_id: str, event_ts_ns: int
+        self,
+        logical_quote_id: str,
+        event_ts_ns: int,
+        *,
+        monotonic_ts_ns: Optional[int] = None,
+        cancel_latency_ns: int = 0,
     ) -> List[ShadowLifecycleEvent]:
-        order = self.resting_orders.pop(logical_quote_id, None)
+        deadline = self._deadline(monotonic_ts_ns, cancel_latency_ns)
+        order = self.resting_orders.get(logical_quote_id)
         if order is None:
+            if logical_quote_id in self._terminal_quote_ids:
+                return []
             raise KeyError("Unknown resting shadow order: {}".format(logical_quote_id))
+        if order.state == "pending_cancel":
+            return []
+        event_types = ["cancel_decision"]
+        if cancel_latency_ns or order.submit_deadline_monotonic_ns is not None:
+            if monotonic_ts_ns is None:
+                raise ValueError("Cancelling a pending submission requires monotonic_ts_ns")
+            # Before submit acknowledgement there is no exchange order ID to
+            # cancel. Keep the submission deadline independent, then allow a
+            # full cancel transport delay once the order can be identified.
+            if order.submit_deadline_monotonic_ns is not None:
+                order.cancel_after_arrival_latency_ns = cancel_latency_ns
+            else:
+                event_types.append("cancel_sent")
+                order.cancel_deadline_monotonic_ns = deadline
+            order.state = "pending_cancel"
+        else:
+            del self.resting_orders[logical_quote_id]
+            self._terminal_quote_ids.add(logical_quote_id)
+            event_types.extend(("cancel_sent", "cancel_acknowledged"))
         return [
             self._event(
                 order.intent,
@@ -417,11 +582,7 @@ class ShadowRiskEngine:
                 order.remaining_quantity,
                 event_ts_ns=event_ts_ns,
             )
-            for event_type in (
-                "cancel_decision",
-                "cancel_sent",
-                "cancel_acknowledged",
-            )
+            for event_type in event_types
         ]
 
     def settle_market(self, market_ticker: str, result: str) -> Decimal:

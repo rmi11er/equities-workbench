@@ -32,6 +32,63 @@ _DEDUPLICATION_RULES = {
         ("pyth_symbol", "timestamp_seconds", "resolution_minutes"),
         ("receive_ts_ns", "run", "record_sha256"),
     ),
+    "kalshi_candlestick": (
+        (
+            "market_ticker",
+            "end_period_ts_ns",
+            "period_interval_minutes",
+        ),
+        ("receive_ts_ns", "run", "record_sha256"),
+    ),
+    "kalshi_candlestick_request": (
+        (
+            "market_ticker",
+            "start_seconds",
+            "end_seconds",
+            "period_interval_minutes",
+        ),
+        ("receive_ts_ns", "run", "record_sha256"),
+    ),
+    "kalshi_trade_request": (
+        ("market_ticker",),
+        ("receive_ts_ns", "run", "record_sha256"),
+    ),
+}
+
+
+# DuckDB infers an all-NULL JSONL field as JSON for an individual segment.  A later
+# segment containing a plain string can then make a Parquet union attempt to parse that
+# string as JSON.  Cast rule-relevant metadata fields inside each file scan, before the
+# UNION BY NAME, so optional fields retain one stable analytical type without rewriting
+# immutable derived Parquet artifacts.
+_CANONICAL_PARQUET_TYPES = {
+    "market_dim": {
+        "market_ticker": "VARCHAR",
+        "event_ticker": "VARCHAR",
+        "series_ticker": "VARCHAR",
+        "metal": "VARCHAR",
+        "open_ts_ns": "BIGINT",
+        "close_ts_ns": "BIGINT",
+        "determination_ts_ns": "BIGINT",
+        "target_price": "VARCHAR",
+        "round_digits": "BIGINT",
+        "strike_type": "VARCHAR",
+        "settlement_source_name": "VARCHAR",
+        "settlement_source_url": "VARCHAR",
+        "rules_primary": "VARCHAR",
+        "rules_secondary": "VARCHAR",
+        "pyth_symbol": "VARCHAR",
+        "pyth_feed_id": "VARCHAR",
+        "price_level_structure": "VARCHAR",
+        "price_ranges_json": "VARCHAR",
+        "fractional_enabled": "BOOLEAN",
+        "exchange_index": "BIGINT",
+        "metadata_version": "BIGINT",
+        "metadata_hash": "VARCHAR",
+        "metadata_receive_ts_ns": "BIGINT",
+        "previous_record_sha256": "VARCHAR",
+        "record_sha256": "VARCHAR",
+    }
 }
 
 
@@ -62,6 +119,47 @@ def _available_columns(connection, view_name: str) -> set:
             "DESCRIBE SELECT * FROM {}".format(_identifier(view_name))
         ).fetchall()
     }
+
+
+def _parquet_file_select(connection, path: Path, stream: str) -> str:
+    relation = "read_parquet('{}', hive_partitioning=true)".format(
+        _sql_literal(path)
+    )
+    columns = {
+        row[0]
+        for row in connection.execute(
+            "DESCRIBE SELECT * FROM {}".format(relation)
+        ).fetchall()
+    }
+    replacements = [
+        "CAST({column} AS {sql_type}) AS {column}".format(
+            column=_identifier(column),
+            sql_type=sql_type,
+        )
+        for column, sql_type in _CANONICAL_PARQUET_TYPES.get(stream, {}).items()
+        if column in columns
+    ]
+    if not replacements:
+        return "SELECT * FROM {}".format(relation)
+    return "SELECT * REPLACE ({}) FROM {}".format(
+        ", ".join(replacements), relation
+    )
+
+
+def _all_runs_select(connection, stream_dir: Path) -> str:
+    stream = stream_dir.name
+    pattern = stream_dir / "**" / "*.parquet"
+    if stream not in _CANONICAL_PARQUET_TYPES:
+        return (
+            "SELECT * FROM read_parquet('{}', "
+            "hive_partitioning=true, union_by_name=true)"
+        ).format(_sql_literal(pattern))
+    files = sorted(stream_dir.glob("**/*.parquet"))
+    if not files:
+        raise ValueError("No Parquet files found for stream: {}".format(stream))
+    return " UNION ALL BY NAME ".join(
+        _parquet_file_select(connection, path, stream) for path in files
+    )
 
 
 def _deduplicated_select(
@@ -149,13 +247,12 @@ def build_duckdb_catalog(root: Path) -> Path:
         for stream_dir in stream_directories:
             view_name = stream_dir.name
             _identifier(view_name)
-            pattern = stream_dir / "**" / "*.parquet"
             all_runs_view = "{}_all_runs".format(view_name)
             raw_view = "{}_raw".format(view_name)
             connection.execute(
-                "CREATE OR REPLACE VIEW {} AS SELECT * FROM "
-                "read_parquet('{}', hive_partitioning=true, union_by_name=true)".format(
-                    _identifier(all_runs_view), _sql_literal(pattern)
+                "CREATE OR REPLACE VIEW {} AS {}".format(
+                    _identifier(all_runs_view),
+                    _all_runs_select(connection, stream_dir),
                 )
             )
             connection.execute(

@@ -132,10 +132,10 @@ def compute_adaptive_params(metrics: LiquidityMetrics) -> AdaptiveParams:
     # Low liquidity (0.0) -> multiplier 3.0 (wider)
     spread_multiplier = 0.5 + 2.5 * (1.0 - score)
 
-    # Size: also inverse - in liquid markets, smaller size to get queue priority
-    # High liquidity -> 0.5x size
-    # Low liquidity -> 1.5x size
-    size_multiplier = 0.5 + 1.0 * (1.0 - score)
+    # Size: keep constant (dollar-based sizing already handles this)
+    # The quote_size_dollars config specifies the dollar amount per quote,
+    # so we don't need to adjust based on liquidity
+    size_multiplier = 1.0
 
     # Urgency: how aggressively to join/improve
     # High liquidity -> more urgent (need to compete)

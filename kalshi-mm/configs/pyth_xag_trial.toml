@@ -1,0 +1,35 @@
+# Read-only configuration for the generic Metal.XAG/USD trial feed.
+# This file does not authorize collection or live orders. Retaining Pyth Lazer
+# messages still requires a content-addressed provider approval in [governance].
+
+environment = "production"
+
+[storage]
+root = "data/metals"
+fsync_every_records = 1
+
+[pyth]
+enabled = true
+api_key_env = "PYTH_API_KEY"
+endpoint = "https://pyth.dourolabs.app/v1"
+lazer_ws_endpoints = [
+  "wss://pyth-lazer-0.dourolabs.app/v1/stream",
+  "wss://pyth-lazer-1.dourolabs.app/v1/stream",
+  "wss://pyth-lazer-2.dourolabs.app/v1/stream",
+]
+history_chunk_seconds = 86400
+
+[governance]
+provider_approval_path = ""
+pyth_historical_research_assumption_path = "data/metals/policies/historical_research_assumption/assumption=085d23ae81e24f44ea4abcfd3fa6bdc55772b8b1802bc307ebe9cc7c5364123d/assumption.json"
+databento_historical_research_assumption_path = ""
+
+[products.silver-xag-proxy]
+enabled = true
+series_tickers = []
+ticker_prefixes = []
+title_keywords = ["silver"]
+pyth_symbol = "Metal.XAG/USD"
+pyth_feed_id = ""
+pyth_lazer_id = 345
+cme_symbols = []

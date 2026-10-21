@@ -6,7 +6,6 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-
 DATA_GATE_THRESHOLDS = {
     "kalshi_valid_fraction": 0.999,
     "pyth_valid_fraction": 0.995,
@@ -39,26 +38,67 @@ def evaluate_data_gates(report: Dict[str, Any]) -> Dict[str, Any]:
             "kalshi_sequence_gaps",
             "websocket_disconnects",
             "pyth_missing_intervals",
+            "pyth_gap_events",
+            "pyth_transport_disconnects",
             "cme_sequence_gaps",
             "cme_reconnects",
             "cme_collection_errors",
+            "cme_disconnects",
+            "cme_normalization_queue_overflows",
+            "ingestion_monotonic_regressions",
+            "clock_probe_errors",
+            "clock_elapsed_discontinuities",
         )
     )
     classified_intervals = sum(
         1 for item in missing_intervals if bool(str(item.get("reason", "")).strip())
     )
     expected_windows = int(report.get("expected_windows", 0))
-    required_settlements = min(1000, expected_windows) if expected_windows > 0 else 1000
+    has_complete_settlement_evidence = all(
+        field in checksum for field in ("expected", "excluded", "resolved", "complete")
+    )
+    if has_complete_settlement_evidence:
+        expected_settlements = int(checksum.get("expected", 0))
+        excluded_settlements = int(checksum.get("excluded", 0))
+        resolved_settlements = int(checksum.get("resolved", 0))
+        required_settlements = expected_settlements - excluded_settlements
+        settlement_passed = (
+            bool(checksum.get("complete"))
+            and expected_settlements == expected_windows
+            and 0 <= excluded_settlements <= expected_settlements
+            and resolved_settlements == expected_settlements
+            and checked == required_settlements
+            and agreements == checked
+            and disagreements == 0
+        )
+    else:
+        required_settlements = (
+            min(1000, expected_windows) if expected_windows > 0 else 1000
+        )
+        settlement_passed = (
+            checked >= required_settlements
+            and agreements == checked
+            and disagreements == 0
+        )
 
     gates = {
         "settlement_agreement": {
-            "passed": checked >= required_settlements
-            and agreements == checked
-            and disagreements == 0,
-            "observed": {"checked": checked, "agreements": agreements},
+            "passed": settlement_passed,
+            "observed": {
+                "expected": checksum.get("expected"),
+                "checked": checked,
+                "agreements": agreements,
+                "disagreements": disagreements,
+                "excluded": checksum.get("excluded"),
+                "resolved": checksum.get("resolved"),
+                "complete": checksum.get("complete"),
+            },
             "required": {
                 "minimum_checked": required_settlements,
-                "agreement": "100% on usable audited windows",
+                "agreement": (
+                    "every expected window is exactly audited or classified excluded; "
+                    "100% agreement on usable audited windows"
+                ),
             },
         },
         "no_invalid_book_decisions": {
@@ -101,6 +141,18 @@ def evaluate_data_gates(report: Dict[str, Any]) -> Dict[str, Any]:
             "passed": bool(report.get("clock_error_within_edge_half_life", False)),
             "observed": report.get("clock_offset_abs_max_ns"),
             "required": "clock error measured and small relative to edge half-life",
+        },
+        "causal_receive_order": {
+            "passed": bool(report.get("causal_ordering_checked", False))
+            and int(report.get("timestamp_ordering_violations", 0)) == 0,
+            "observed": {
+                "checked": bool(report.get("causal_ordering_checked", False)),
+                "violations": int(report.get("timestamp_ordering_violations", 0)),
+            },
+            "required": (
+                "global receive ordering checked and no feature/input timestamp "
+                "later than its decision receive key"
+            ),
         },
         "rules_unchanged": {
             "passed": bool(report.get("metadata_rules_validated", False))
@@ -158,20 +210,21 @@ class QualityTracker:
         end_ts_ns: Optional[int],
         reason: str,
         ticker: Optional[str] = None,
-    ) -> None:
-        self.missing_intervals.append(
-            {
-                "source": source,
-                "ticker": ticker,
-                "start_ts_ns": start_ts_ns,
-                "end_ts_ns": end_ts_ns,
-                "reason": reason,
-            }
-        )
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        interval = {
+            "source": source,
+            "ticker": ticker,
+            "start_ts_ns": start_ts_ns,
+            "end_ts_ns": end_ts_ns,
+            "reason": reason,
+        }
+        if details:
+            interval["details"] = dict(details)
+        self.missing_intervals.append(interval)
+        return interval
 
-    def record_source_coverage(
-        self, source: str, valid_ns: int, total_ns: int
-    ) -> None:
+    def record_source_coverage(self, source: str, valid_ns: int, total_ns: int) -> None:
         if valid_ns < 0 or total_ns < 0 or valid_ns > total_ns:
             raise ValueError("Coverage durations must satisfy 0 <= valid <= total")
         self.source_coverage_ns[source]["valid_ns"] += valid_ns
@@ -216,16 +269,22 @@ class QualityTracker:
                 "disagreements": self.counters.get("settlement_disagreements", 0),
             },
             "kalshi_sequence_gaps": self.counters.get("kalshi_sequence_gaps", 0),
-            "websocket_disconnects": self.counters.get(
-                "websocket_disconnects", 0
-            ),
-            "pyth_missing_intervals": self.counters.get(
-                "pyth_missing_intervals", 0
+            "websocket_disconnects": self.counters.get("websocket_disconnects", 0),
+            "websocket_reconnects": self.counters.get("websocket_reconnects", 0),
+            "pyth_missing_intervals": self.counters.get("pyth_missing_intervals", 0),
+            "pyth_gap_events": self.counters.get("pyth_gap_events", 0),
+            "pyth_transport_disconnects": self.counters.get(
+                "pyth_transport_disconnects", 0
             ),
             "cme_sequence_gaps": self.counters.get("cme_sequence_gaps", 0),
             "cme_reconnects": self.counters.get("cme_reconnects", 0),
-            "cme_collection_errors": self.counters.get(
-                "cme_collection_errors", 0
+            "cme_collection_errors": self.counters.get("cme_collection_errors", 0),
+            "cme_disconnects": self.counters.get("cme_disconnects", 0),
+            "cme_normalization_queue_overflows": self.counters.get(
+                "cme_normalization_queue_overflows", 0
+            ),
+            "ingestion_monotonic_regressions": self.counters.get(
+                "ingestion_monotonic_regressions", 0
             ),
             "duplicate_messages": self.counters.get("duplicate_messages", 0),
             "strategy_decisions_on_invalid_book": self.counters.get(
@@ -235,9 +294,10 @@ class QualityTracker:
             "timestamp_ordering_violations": self.counters.get(
                 "timestamp_ordering_violations", 0
             ),
-            "unknown_aggressor_side": self.counters.get(
-                "unknown_aggressor_side", 0
+            "causal_ordering_checked": bool(
+                self.counters.get("causal_ordering_checked", 0)
             ),
+            "unknown_aggressor_side": self.counters.get("unknown_aggressor_side", 0),
             "fractional_quantity_parsing_failures": self.counters.get(
                 "fractional_quantity_parsing_failures", 0
             ),
@@ -260,6 +320,10 @@ class QualityTracker:
             "clock_offset_abs_max_ns": clock_abs_max,
             "clock_error_within_edge_half_life": bool(
                 self.counters.get("clock_error_within_edge_half_life", 0)
+            ),
+            "clock_probe_errors": self.counters.get("clock_probe_errors", 0),
+            "clock_elapsed_discontinuities": self.counters.get(
+                "clock_elapsed_discontinuities", 0
             ),
             "raw_records": self.counters.get("raw_records", 0),
             "book_snapshots": self.counters.get("book_snapshots", 0),

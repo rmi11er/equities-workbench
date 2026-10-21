@@ -8,16 +8,24 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
 from .config import MetalsConfig
+from .historical_research_assumption import require_config_historical_operation
+from .provider_approval import require_config_provider_operation
 from .storage import PartitionedRawStore, update_run_manifest, write_run_manifest
 
 
 class PythAccessError(RuntimeError):
     pass
+
+
+PYTH_GENERIC_PROXY_SYMBOLS = {
+    "silver": "Metal.XAG/USD",
+    "gold": "Metal.XAU/USD",
+}
 
 
 @dataclass(frozen=True)
@@ -115,15 +123,14 @@ async def backfill_pyth_history(
     start_seconds: int,
     end_seconds: int,
 ) -> Dict[str, int]:
+    approval = require_config_provider_operation(config, "pyth", "exact_history")
     product = config.products.get(metal)
     if product is None or not product.pyth_symbol:
         raise ValueError("No Pyth symbol configured for {}".format(metal))
     api_key = os.environ.get(config.pyth.api_key_env, "").strip()
     if not api_key:
         raise PythAccessError(
-            "Set {} to a Pyth Pro trial or licensed key".format(
-                config.pyth.api_key_env
-            )
+            "Set {} to a Pyth Pro trial or licensed key".format(config.pyth.api_key_env)
         )
 
     raw_store = PartitionedRawStore(
@@ -137,8 +144,17 @@ async def backfill_pyth_history(
         fsync_every_records=config.storage.fsync_every_records,
         tier="normalized",
     )
+    manifest_config = config.public_snapshot()
+    manifest_config["collector"] = {
+        "component": "pyth_tradingview_history",
+        "provider_approval_id": approval.approval_id,
+        "read_only": True,
+    }
     write_run_manifest(
-        Path(config.storage.root), raw_store.run_id, config.public_snapshot()
+        Path(config.storage.root),
+        raw_store.run_id,
+        manifest_config,
+        output_paths=(approval.approval_path, approval.manifest_path),
     )
     client = PythHistoryClient(config.pyth.endpoint, api_key)
     counts = {"requests": 0, "candles": 0}
@@ -150,9 +166,7 @@ async def backfill_pyth_history(
                 end_seconds,
                 cursor + config.pyth.history_chunk_seconds - 1,
             )
-            response = await client.get_history(
-                product.pyth_symbol, cursor, chunk_end
-            )
+            response = await client.get_history(product.pyth_symbol, cursor, chunk_end)
             raw_store.write(
                 source="pyth",
                 stream="history_1m",
@@ -202,11 +216,151 @@ async def backfill_pyth_history(
             ),
             counts=counts,
             output_paths=raw_store.paths + normalized_store.paths,
-            errors=[
-                item
-                for item in (failure, close_failure)
-                if item is not None
-            ],
+            errors=[item for item in (failure, close_failure) if item is not None],
+        )
+        if failure is None and close_failure is not None:
+            raise close_failure
+    return counts
+
+
+async def backfill_pyth_proxy_history(
+    config: MetalsConfig,
+    metal: str,
+    start_seconds: int,
+    end_seconds: int,
+    *,
+    client: PythHistoryClient | None = None,
+) -> Dict[str, Any]:
+    """Archive generic spot candles as research-only settlement proxies.
+
+    This path is deliberately separate from :func:`backfill_pyth_history` and
+    writes a distinct stream that can never satisfy exact-settlement checks.
+    Only the fixed XAG/XAU mapping is accepted; callers cannot silently replace
+    the configured proprietary ``Metal.Index.*`` settlement source.
+    """
+
+    normalized_metal = metal.strip().lower()
+    symbol = PYTH_GENERIC_PROXY_SYMBOLS.get(normalized_metal)
+    if symbol is None:
+        raise ValueError("Pyth generic proxy history supports only silver and gold")
+    if end_seconds < start_seconds:
+        raise ValueError("Pyth proxy History end must be at or after start")
+
+    authority = require_config_historical_operation(
+        config, "pyth", "exact_history"
+    )
+    api_key = os.environ.get(config.pyth.api_key_env, "").strip()
+    if not api_key:
+        raise PythAccessError(
+            "Set {} to a Pyth Pro trial or licensed key".format(
+                config.pyth.api_key_env
+            )
+        )
+
+    raw_store = PartitionedRawStore(
+        Path(config.storage.root),
+        fsync_every_records=config.storage.fsync_every_records,
+        tier="raw",
+    )
+    normalized_store = PartitionedRawStore(
+        Path(config.storage.root),
+        run_id=raw_store.run_id,
+        fsync_every_records=config.storage.fsync_every_records,
+        tier="normalized",
+    )
+    manifest_config = config.public_snapshot()
+    manifest_config["collector"] = {
+        "component": "pyth_generic_proxy_history",
+        "metal": normalized_metal,
+        "symbol": symbol,
+        "research_only": True,
+        "settlement_eligible": False,
+        **authority.manifest_fields(),
+    }
+    write_run_manifest(
+        Path(config.storage.root),
+        raw_store.run_id,
+        manifest_config,
+        output_paths=authority.output_paths,
+    )
+    history_client = client or PythHistoryClient(
+        config.pyth.endpoint, api_key
+    )
+    counts: Dict[str, Any] = {
+        "requests": 0,
+        "candles": 0,
+        "symbol": symbol,
+        "settlement_eligible": False,
+    }
+    cursor = start_seconds
+    failure: Optional[BaseException] = None
+    try:
+        while cursor <= end_seconds:
+            chunk_end = min(
+                end_seconds,
+                cursor + config.pyth.history_chunk_seconds - 1,
+            )
+            response = await history_client.get_history(symbol, cursor, chunk_end)
+            raw_store.write(
+                source="pyth_proxy_history",
+                stream="history_1m",
+                metal=normalized_metal,
+                receive_ts_ns=response.receive_ts_ns,
+                record={
+                    "source": "pyth",
+                    "stream": "generic_proxy_history_1m",
+                    "metal": normalized_metal,
+                    "pyth_symbol": symbol,
+                    "receive_ts_ns": response.receive_ts_ns,
+                    "local_monotonic_ts_ns": response.local_monotonic_ts_ns,
+                    "params": response.params,
+                    "raw_body": response.raw_body,
+                    "research_only": True,
+                    "settlement_eligible": False,
+                },
+            )
+            rows = normalize_tradingview_history(
+                response.payload, symbol, response.receive_ts_ns
+            )
+            for row in rows:
+                normalized_store.write(
+                    source="pyth_proxy_candle",
+                    stream="pyth_proxy_candle",
+                    metal=normalized_metal,
+                    receive_ts_ns=response.receive_ts_ns,
+                    record={
+                        **row,
+                        "metal": normalized_metal,
+                        "research_only": True,
+                        "settlement_eligible": False,
+                        "proxy_role": "generic_spot",
+                    },
+                )
+            counts["requests"] += 1
+            counts["candles"] += len(rows)
+            cursor = chunk_end + 1
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        close_failure: Optional[BaseException] = None
+        for store in (raw_store, normalized_store):
+            try:
+                store.close()
+            except BaseException as close_error:
+                if close_failure is None:
+                    close_failure = close_error
+        update_run_manifest(
+            Path(config.storage.root),
+            raw_store.run_id,
+            status=(
+                "failed"
+                if failure is not None or close_failure is not None
+                else "completed"
+            ),
+            counts=counts,
+            output_paths=raw_store.paths + normalized_store.paths,
+            errors=[item for item in (failure, close_failure) if item is not None],
         )
         if failure is None and close_failure is not None:
             raise close_failure

@@ -17,6 +17,7 @@ import websockets
 from src.auth import KalshiAuth
 
 from .config import KalshiConfig, ResolvedKalshiCredentials
+from .ingestion import GlobalReceiveSequencer, ReceiveStamp
 from .sequence import SequenceTracker
 from .timeutil import iso8601_to_ns
 from .types import SequenceStatus, SourceEnvelope
@@ -45,6 +46,7 @@ class ReceivedResponse:
     local_monotonic_ts_ns: int
     payload: Dict[str, Any]
     raw_body: str
+    receive_stamp: Optional[ReceiveStamp] = None
 
 
 class KalshiReadClient:
@@ -54,6 +56,7 @@ class KalshiReadClient:
         self,
         config: KalshiConfig,
         credentials: Optional[ResolvedKalshiCredentials],
+        sequencer: Optional[GlobalReceiveSequencer] = None,
     ) -> None:
         self.config = config
         self._auth = (
@@ -67,6 +70,7 @@ class KalshiReadClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._pace_lock = asyncio.Lock()
         self._next_request_monotonic = 0.0
+        self.sequencer = sequencer
 
     async def _pace_read(self) -> None:
         rate = self.config.max_read_requests_per_second
@@ -126,6 +130,16 @@ class KalshiReadClient:
                         payload = {"body": raw_body}
                     receive_ts_ns = time.time_ns()
                     receive_monotonic_ns = time.monotonic_ns()
+                    receive_stamp = (
+                        self.sequencer.stamp(
+                            "kalshi",
+                            "rest:{}".format(path),
+                            receive_ts_ns=receive_ts_ns,
+                            local_monotonic_ts_ns=receive_monotonic_ns,
+                        )
+                        if self.sequencer is not None
+                        else None
+                    )
                     retryable = response.status == 429 or response.status in (
                         500,
                         502,
@@ -150,6 +164,7 @@ class KalshiReadClient:
                             local_monotonic_ts_ns=receive_monotonic_ns,
                             payload=payload,
                             raw_body=raw_body,
+                            receive_stamp=receive_stamp,
                         )
             except aiohttp.ClientError as error:
                 if attempt >= self.config.max_read_retries:
@@ -213,13 +228,18 @@ class KalshiWebSocketReader:
         self,
         config: KalshiConfig,
         credentials: ResolvedKalshiCredentials,
+        sequencer: Optional[GlobalReceiveSequencer] = None,
+        websocket_max_queue: int = 1_024,
     ) -> None:
+        if websocket_max_queue < 1:
+            raise ValueError("websocket_max_queue must be at least one")
         self.config = config
         self._auth = KalshiAuth(
             api_key_id=credentials.api_key_id,
             private_key_path=credentials.private_key_path,
         )
-        self._ingestion_sequence = 0
+        self.sequencer = sequencer or GlobalReceiveSequencer()
+        self.websocket_max_queue = websocket_max_queue
         self._sequence = SequenceTracker()
 
     async def events(
@@ -228,8 +248,10 @@ class KalshiWebSocketReader:
         pyth_underlyings: Optional[List[str]] = None,
         stop_event: Optional[asyncio.Event] = None,
     ) -> AsyncIterator[SourceEnvelope]:
-        if not tickers:
-            raise ValueError("At least one ticker is required for WebSocket collection")
+        if not tickers and not pyth_underlyings:
+            raise ValueError(
+                "At least one ticker or Pyth underlying is required for WebSocket collection"
+            )
 
         headers = self._auth.get_auth_headers("GET", WS_SIGNING_PATH)
         connection_id = str(uuid.uuid4())
@@ -238,7 +260,7 @@ class KalshiWebSocketReader:
             additional_headers=headers,
             ping_interval=10,
             ping_timeout=20,
-            max_queue=None,
+            max_queue=self.websocket_max_queue,
         ) as websocket:
             # One order-book subscription per market isolates sequence gaps and
             # snapshot recovery. Public trades can share one subscription.
@@ -256,8 +278,8 @@ class KalshiWebSocketReader:
                     }
                 )
                 next_command_id += 1
-            subscriptions.extend(
-                [
+            if tickers:
+                subscriptions.append(
                     {
                         "id": next_command_id,
                         "cmd": "subscribe",
@@ -265,15 +287,17 @@ class KalshiWebSocketReader:
                             "channels": ["trade"],
                             "market_tickers": tickers,
                         },
-                    },
-                    {
-                        "id": next_command_id + 1,
-                        "cmd": "subscribe",
-                        "params": {"channels": ["market_lifecycle_v2"]},
-                    },
-                ]
+                    }
+                )
+                next_command_id += 1
+            subscriptions.append(
+                {
+                    "id": next_command_id,
+                    "cmd": "subscribe",
+                    "params": {"channels": ["market_lifecycle_v2"]},
+                }
             )
-            next_command_id += 2
+            next_command_id += 1
             if pyth_underlyings:
                 subscriptions.append(
                     {
@@ -296,20 +320,42 @@ class KalshiWebSocketReader:
                 if stop_event is not None:
                     stop_task = asyncio.ensure_future(stop_event.wait())
                     waiters.append(stop_task)
-                done, pending = await asyncio.wait(
-                    waiters, return_when=asyncio.FIRST_COMPLETED
-                )
+                try:
+                    done, pending = await asyncio.wait(
+                        waiters, return_when=asyncio.FIRST_COMPLETED
+                    )
+                except BaseException:
+                    # Cancelling the async generator (ticker rollover or normal
+                    # collector shutdown) also has to consume the child recv
+                    # result.  Otherwise the socket context can close first and
+                    # leave a noisy "Task exception was never retrieved" behind.
+                    for waiter in waiters:
+                        if not waiter.done():
+                            waiter.cancel()
+                    await asyncio.gather(*waiters, return_exceptions=True)
+                    raise
                 for pending_task in pending:
                     pending_task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
                 if stop_task is not None and stop_task in done and stop_task.result():
-                    receive_task.cancel()
+                    if not receive_task.done():
+                        receive_task.cancel()
+                    await asyncio.gather(*done, return_exceptions=True)
                     break
 
                 raw_text = receive_task.result()
                 local_monotonic_ts_ns = time.monotonic_ns()
                 receive_ts_ns = time.time_ns()
+                # Allocate the process-global receive key before parsing. The
+                # storage layer must preserve this stamp rather than replacing it.
+                stamp = self.sequencer.stamp(
+                    "kalshi",
+                    "websocket",
+                    receive_ts_ns=receive_ts_ns,
+                    local_monotonic_ts_ns=local_monotonic_ts_ns,
+                )
                 parsed = json.loads(raw_text, parse_float=Decimal)
-                self._ingestion_sequence += 1
                 sid = parsed.get("sid")
                 sequence = parsed.get("seq")
                 sequence_key = "{}:{}".format(connection_id, sid)
@@ -320,9 +366,9 @@ class KalshiWebSocketReader:
                 envelope = SourceEnvelope(
                     source="kalshi",
                     stream=str(parsed.get("type", "unknown")),
-                    ingestion_sequence=self._ingestion_sequence,
-                    local_monotonic_ts_ns=local_monotonic_ts_ns,
-                    receive_ts_ns=receive_ts_ns,
+                    ingestion_sequence=stamp.ingestion_sequence,
+                    local_monotonic_ts_ns=stamp.local_monotonic_ts_ns,
+                    receive_ts_ns=stamp.receive_ts_ns,
                     raw=parsed,
                     raw_text=raw_text,
                     source_sequence=sequence,
@@ -338,6 +384,8 @@ class KalshiWebSocketReader:
                     subscription_id=str(sid) if sid is not None else None,
                     sequence_status=decision.status.value,
                     gap_flag=decision.status == SequenceStatus.GAP,
+                    previous_monotonic_ts_ns=stamp.previous_monotonic_ts_ns,
+                    monotonic_regression=stamp.monotonic_regression,
                 )
                 yield envelope
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import MetalsConfig
 from .shadow import (
@@ -18,7 +18,12 @@ from .storage import PartitionedRawStore, update_run_manifest, write_run_manifes
 class ShadowSession:
     """Record every counterfactual decision and lifecycle transition."""
 
-    def __init__(self, config: MetalsConfig) -> None:
+    def __init__(
+        self,
+        config: MetalsConfig,
+        *,
+        manifest_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not config.shadow.enabled:
             raise ValueError("Shadow session is disabled")
         self.config = config
@@ -33,10 +38,16 @@ class ShadowSession:
             "shadow_decisions": 0,
             "order_lifecycle_events": 0,
             "shadow_fills": 0,
+            "forward_fair_decisions": 0,
+            "long_vol_candidate_decisions": 0,
+            "shadow_fill_attributions": 0,
         }
         self._closed = False
+        manifest_config = config.public_snapshot()
+        if manifest_context:
+            manifest_config["forward_shadow"] = dict(manifest_context)
         write_run_manifest(
-            Path(config.storage.root), self.run_id, config.public_snapshot()
+            Path(config.storage.root), self.run_id, manifest_config
         )
 
     def _write(
@@ -59,9 +70,17 @@ class ShadowSession:
             self.counts["shadow_fills"] += 1
 
     def place(
-        self, intent: ShadowOrderIntent
+        self,
+        intent: ShadowOrderIntent,
+        *,
+        monotonic_ts_ns: Optional[int] = None,
+        submit_latency_ns: int = 0,
     ) -> Tuple[ShadowRiskDecision, List[ShadowLifecycleEvent]]:
-        decision, events = self.engine.place(intent)
+        decision, events = self.engine.place(
+            intent,
+            monotonic_ts_ns=monotonic_ts_ns,
+            submit_latency_ns=submit_latency_ns,
+        )
         self._write(
             "shadow_decision",
             intent.metal,
@@ -74,6 +93,12 @@ class ShadowSession:
                 "config_version": intent.config_version,
                 "state_snapshot_hash": intent.state_snapshot_hash,
                 "decision_ts_ns": intent.decision_ts_ns,
+                "monotonic_ts_ns": monotonic_ts_ns,
+                "submit_latency_ns": submit_latency_ns,
+                "outcome_side": intent.outcome_side,
+                "price_dollars": intent.price_dollars,
+                "quantity_fp": intent.quantity_fp,
+                "worst_case_fee_dollars": intent.worst_case_fee_dollars,
                 "approved": decision.approved,
                 "rejection_reasons": list(decision.rejection_reasons),
                 "risk_snapshot": decision.snapshot.to_dict(),
@@ -84,6 +109,39 @@ class ShadowSession:
         for event in events:
             self._write_event(intent.metal, event)
         return decision, events
+
+    def record_forward_fair_decision(
+        self,
+        metal: str,
+        event_ts_ns: int,
+        record: Dict[str, Any],
+    ) -> None:
+        """Persist one causal fair/quote evaluation alongside shadow lifecycle."""
+
+        self._write("forward_fair_decision", metal, event_ts_ns, record)
+        self.counts["forward_fair_decisions"] += 1
+
+    def record_shadow_fill_attribution(
+        self,
+        metal: str,
+        event_ts_ns: int,
+        record: Dict[str, Any],
+    ) -> None:
+        """Bind a simulated fill to the observed trade and frozen fill rule."""
+
+        self._write("shadow_fill_attribution", metal, event_ts_ns, record)
+        self.counts["shadow_fill_attributions"] += 1
+
+    def record_long_vol_candidate(
+        self,
+        metal: str,
+        event_ts_ns: int,
+        record: Dict[str, Any],
+    ) -> None:
+        """Persist a research-only long-vol evaluation, including rejections."""
+
+        self._write("long_vol_candidate", metal, event_ts_ns, record)
+        self.counts["long_vol_candidate_decisions"] += 1
 
     def fill(
         self,
@@ -106,15 +164,39 @@ class ShadowSession:
         return event
 
     def cancel(
-        self, logical_quote_id: str, event_ts_ns: int
+        self,
+        logical_quote_id: str,
+        event_ts_ns: int,
+        *,
+        monotonic_ts_ns: Optional[int] = None,
+        cancel_latency_ns: int = 0,
     ) -> List[ShadowLifecycleEvent]:
         order = self.engine.resting_orders.get(logical_quote_id)
-        if order is None:
-            raise KeyError("Unknown resting shadow order: {}".format(logical_quote_id))
-        metal = order.intent.metal
-        events = self.engine.cancel(logical_quote_id, event_ts_ns)
+        events = self.engine.cancel(
+            logical_quote_id,
+            event_ts_ns,
+            monotonic_ts_ns=monotonic_ts_ns,
+            cancel_latency_ns=cancel_latency_ns,
+        )
         for event in events:
-            self._write_event(metal, event)
+            self._write_event(order.intent.metal, event)
+        return events
+
+    def advance(
+        self,
+        event_ts_ns: int,
+        monotonic_ts_ns: int,
+        can_rest: Callable[[ShadowOrderIntent], bool],
+    ) -> List[ShadowLifecycleEvent]:
+        """Persist simulated arrivals, post-only rejections, and cancel acks."""
+
+        metals = {
+            quote_id: order.intent.metal
+            for quote_id, order in self.engine.resting_orders.items()
+        }
+        events = self.engine.advance(event_ts_ns, monotonic_ts_ns, can_rest)
+        for event in events:
+            self._write_event(metals[event.logical_quote_id], event)
         return events
 
     def close(

@@ -7,6 +7,11 @@ import pytest
 
 from src.metals.cme import DatabentoAccessError, DatabentoMetalsRecorder
 from src.metals.config import load_metals_config
+from src.metals.ingestion import GlobalReceiveSequencer
+from src.metals.provider_approval import ProviderApprovalError
+from tests.metals.provider_approval_fixtures import (
+    materialize_approved_provider_path,
+)
 
 
 class FakeCollector:
@@ -62,10 +67,17 @@ class FakeCollector:
 
 def _config(tmp_path: Path, enabled=True):
     config = load_metals_config("configs/metals.example.toml")
+    storage_root = tmp_path / "metals"
     return replace(
         config,
-        storage=replace(config.storage, root=str(tmp_path / "metals")),
+        storage=replace(config.storage, root=str(storage_root)),
         cme=replace(config.cme, enabled=enabled),
+        governance=replace(
+            config.governance,
+            provider_approval_path=(
+                materialize_approved_provider_path(storage_root) if enabled else ""
+            ),
+        ),
     )
 
 
@@ -106,9 +118,7 @@ async def test_recorder_persists_raw_normalized_and_completed_manifest(tmp_path)
     native_paths = list(
         (tmp_path / "metals" / "raw" / "databento_native").glob("**/*.dbn")
     )
-    normalized_paths = list(
-        (tmp_path / "metals" / "normalized").glob("**/*.jsonl")
-    )
+    normalized_paths = list((tmp_path / "metals" / "normalized").glob("**/*.jsonl"))
     assert len(raw_paths) == 2
     assert len(native_paths) == 1
     assert native_paths[0].read_bytes() == b"fake-dbn"
@@ -128,14 +138,30 @@ async def test_recorder_persists_raw_normalized_and_completed_manifest(tmp_path)
     assert manifest["status"] == "completed"
     assert manifest["counts"]["records"] == 2
     assert manifest["errors"] == []
+    assert manifest["config"]["collector"]["provider_approval_id"]
+    approval_path = Path(recorder.config.governance.provider_approval_path)
+    assert {str(approval_path), str(approval_path.parent / "manifest.json")}.issubset(
+        manifest["output_paths"]
+    )
+
+
+def test_live_databento_requires_frozen_provider_approval_before_storage(tmp_path):
+    config = _config(tmp_path)
+    config = replace(
+        config,
+        governance=replace(config.governance, provider_approval_path=""),
+    )
+
+    with pytest.raises(ProviderApprovalError, match="approval path"):
+        DatabentoMetalsRecorder(config, "silver", collector=FakeCollector())
+
+    assert not (tmp_path / "metals" / "raw").exists()
 
 
 @pytest.mark.asyncio
 async def test_recorder_marks_manifest_failed_on_callback_error(tmp_path):
     collector = FakeCollector(error=RuntimeError("feed disconnected"))
-    recorder = DatabentoMetalsRecorder(
-        _config(tmp_path), "silver", collector=collector
-    )
+    recorder = DatabentoMetalsRecorder(_config(tmp_path), "silver", collector=collector)
 
     with pytest.raises(DatabentoAccessError):
         await recorder.run(duration_seconds=0.1)
@@ -216,9 +242,7 @@ async def test_recorder_records_reconnect_gap_and_classification(tmp_path):
 @pytest.mark.asyncio
 async def test_recorder_fails_if_feed_closes_without_local_stop(tmp_path):
     collector = FakeCollector(closes_unexpectedly=True)
-    recorder = DatabentoMetalsRecorder(
-        _config(tmp_path), "silver", collector=collector
-    )
+    recorder = DatabentoMetalsRecorder(_config(tmp_path), "silver", collector=collector)
 
     with pytest.raises(DatabentoAccessError, match="closed unexpectedly"):
         await recorder.run()
@@ -229,3 +253,57 @@ def test_recorder_requires_explicit_cme_enablement(tmp_path):
         DatabentoMetalsRecorder(
             _config(tmp_path, enabled=False), "silver", collector=FakeCollector()
         )
+
+
+@pytest.mark.asyncio
+async def test_callback_edge_global_stamp_is_persisted_and_regression_classified(
+    tmp_path,
+):
+    sequencer = GlobalReceiveSequencer()
+    sequencer.stamp(
+        "test",
+        "future_clock",
+        receive_ts_ns=1,
+        local_monotonic_ts_ns=10**30,
+    )
+    recorder = DatabentoMetalsRecorder(
+        _config(tmp_path),
+        "silver",
+        collector=FakeCollector([_record("mbo", 1)]),
+        max_records=1,
+        sequencer=sequencer,
+    )
+
+    await recorder.run()
+
+    raw_path = next(
+        (tmp_path / "metals" / "raw" / "databento_extracted").glob("**/*.jsonl")
+    )
+    row = json.loads(raw_path.read_text(encoding="utf-8"))
+    assert row["ingestion_sequence"] == 2
+    assert row["monotonic_regression"] is True
+    report_path = next(
+        (tmp_path / "metals" / "derived" / "daily_quality").glob("**/report.json")
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["ingestion_monotonic_regressions"] == 1
+    assert report["missing_intervals"][0]["reason"] == "global_monotonic_regression"
+
+
+def test_callback_queue_overflow_is_fail_closed_and_classified(tmp_path):
+    recorder = DatabentoMetalsRecorder(
+        _config(tmp_path),
+        "silver",
+        collector=FakeCollector(),
+        queue_maxsize=1,
+    )
+
+    recorder._enqueue_record(_record("mbo", 1))
+    recorder._enqueue_record(_record("mbo", 2))
+
+    assert recorder._done.is_set()
+    assert recorder.quality.counters["cme_normalization_queue_overflows"] == 1
+    assert recorder.quality.missing_intervals[0]["reason"] == (
+        "normalization_queue_overflow"
+    )
+    recorder._finalize("failed", recorder._errors[0])

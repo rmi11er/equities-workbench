@@ -64,8 +64,8 @@ class TestImpulseEngine:
     @pytest.fixture
     def strategy_config(self):
         return StrategyConfig(
-            max_inventory=500,
-            max_order_size=100,
+            max_inventory_dollars=250.0,  # 500 contracts at 50c
+            max_order_size_dollars=50.0,  # 100 contracts at 50c
         )
 
     @pytest.fixture
@@ -85,7 +85,7 @@ class TestImpulseEngine:
 
     def test_hard_limit_bailout_long(self, engine):
         """Test hard limit bailout when very long."""
-        # max_inventory=500, hard_stop_ratio=1.2, so hard_stop=600
+        # max_inventory_dollars=250 at 50c = 500 contracts, hard_stop_ratio=1.2, so hard_stop=600
         action = engine.check_bailout(
             inventory=650,  # > 600
             reservation_price=50.0,

@@ -1,0 +1,31 @@
+{
+  "schema_version": "metals-historical-research-assumption/v1",
+  "assumption_version": "replace-with-reviewed-research-version",
+  "provider": "pyth",
+  "operation": "exact_history",
+  "primary_source_evidence": [
+    {
+      "url": "https://docs.pyth.network/price-feeds/pro/api",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "technical_semantics_version": "replace-with-reviewed-semantics-version",
+  "account_preflight": {
+    "status": "not_checked",
+    "observed_at": "2026-08-30T00:00:00Z",
+    "evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "research_only": true,
+  "no_live": true,
+  "no_orders": true,
+  "operator_acceptance": {
+    "accepted_by": "replace-with-operator-identity",
+    "version": "replace-with-acceptance-version",
+    "accepted_at": "2026-08-30T00:00:00Z"
+  },
+  "valid_until": "2026-09-30T00:00:00Z",
+  "known_limitations": [
+    "This assumption permits exploratory historical research only.",
+    "It is not evidence for live access, execution, settlement certification, or final data readiness."
+  ]
+}

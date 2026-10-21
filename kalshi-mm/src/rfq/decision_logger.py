@@ -44,6 +44,7 @@ class RFQDecisionRecord:
     contracts: int
     leg_count: int
     collection_ticker: Optional[str] = None
+    target_cost_dollars: Optional[float] = None  # Requester's target price (CashOrderQty)
     legs: list[RFQLegRecord] = field(default_factory=list)
 
     # Our pricing
@@ -55,7 +56,9 @@ class RFQDecisionRecord:
     quote_id: Optional[str] = None
     yes_bid: Optional[str] = None  # Dollar string we quoted
     no_bid: Optional[str] = None
-    edge: Optional[float] = None  # Expected edge (theo - yes_bid)
+    edge: Optional[float] = None  # Best edge (max of yes_edge, no_edge) - for backward compat
+    yes_edge: Optional[float] = None  # Edge if they sell us YES (theo - yes_bid)
+    no_edge: Optional[float] = None   # Edge if they sell us NO ((1-theo) - no_bid)
 
     # Filter/skip reason (if not quoted)
     filter_reason: Optional[str] = None
@@ -84,11 +87,19 @@ class QuoteOutcomeRecord:
     rfq_id: str
     timestamp: str
 
-    event_type: str  # "accepted", "confirmed", "executed", "expired", "deleted"
+    event_type: str  # "accepted", "confirmed", "executed", "expired", "deleted", "rfq_deleted"
     accepted_side: Optional[str] = None  # "yes" or "no" if accepted
 
-    # Execution details (if executed)
+    # Execution details (if executed by us)
     execution_price: Optional[float] = None
+
+    # Market execution details (from rfq_deleted - what the RFQ actually traded at)
+    market_execution_price: Optional[float] = None  # target_cost_dollars from rfq_deleted
+
+    # Our quote details (for comparison when we weren't taken)
+    our_yes_bid: Optional[str] = None
+    our_no_bid: Optional[str] = None
+    our_theo: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -215,6 +226,8 @@ def create_decision_record(
     yes_bid: Optional[str] = None,
     no_bid: Optional[str] = None,
     edge: Optional[float] = None,
+    yes_edge: Optional[float] = None,
+    no_edge: Optional[float] = None,
     filter_reason: Optional[str] = None,
     filter_name: Optional[str] = None,
     leg_prices: Optional[dict[str, float]] = None,
@@ -231,7 +244,9 @@ def create_decision_record(
         quote_id: ID of quote we sent (if any)
         yes_bid: YES bid we quoted (dollar string)
         no_bid: NO bid we quoted (dollar string)
-        edge: Expected edge
+        edge: Best edge (max of yes_edge, no_edge)
+        yes_edge: Edge if they sell us YES
+        no_edge: Edge if they sell us NO
         filter_reason: Why we filtered/skipped
         filter_name: Which filter triggered
         leg_prices: Dict of market_ticker -> probability for each leg
@@ -261,6 +276,7 @@ def create_decision_record(
         contracts=rfq.contracts,
         leg_count=rfq.leg_count,
         collection_ticker=rfq.mve_collection_ticker,
+        target_cost_dollars=rfq.target_cost_dollars,
         legs=legs,
         theo_value=theo_value,
         theo_dollars=theo_dollars,
@@ -269,6 +285,8 @@ def create_decision_record(
         yes_bid=yes_bid,
         no_bid=no_bid,
         edge=edge,
+        yes_edge=yes_edge,
+        no_edge=no_edge,
         filter_reason=filter_reason,
         filter_name=filter_name,
         shadow_mode=shadow_mode,
@@ -282,6 +300,10 @@ def create_outcome_record(
     event_type: str,
     accepted_side: Optional[str] = None,
     execution_price: Optional[float] = None,
+    market_execution_price: Optional[float] = None,
+    our_yes_bid: Optional[str] = None,
+    our_no_bid: Optional[str] = None,
+    our_theo: Optional[float] = None,
 ) -> QuoteOutcomeRecord:
     """Helper to create a QuoteOutcomeRecord."""
     return QuoteOutcomeRecord(
@@ -291,4 +313,8 @@ def create_outcome_record(
         event_type=event_type,
         accepted_side=accepted_side,
         execution_price=execution_price,
+        market_execution_price=market_execution_price,
+        our_yes_bid=our_yes_bid,
+        our_no_bid=our_no_bid,
+        our_theo=our_theo,
     )

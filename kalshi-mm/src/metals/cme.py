@@ -18,9 +18,10 @@ from .databento import (
     DeferredDatabentoRecord,
     glbx_metals_subscriptions,
 )
+from .ingestion import GlobalReceiveSequencer, IngestionItem
+from .provider_approval import require_config_provider_operation
 from .quality import QualityTracker
 from .storage import PartitionedRawStore, update_run_manifest, write_run_manifest
-
 
 _NORMALIZED_STREAMS = {
     "mbo": "cme_mbo_event",
@@ -53,6 +54,8 @@ class DatabentoMetalsRecorder:
         metal: str,
         collector: Optional[DatabentoLiveCollector] = None,
         max_records: Optional[int] = None,
+        sequencer: Optional[GlobalReceiveSequencer] = None,
+        queue_maxsize: int = 100_000,
     ) -> None:
         if not config.cme.enabled:
             raise DatabentoAccessError(
@@ -67,12 +70,18 @@ class DatabentoMetalsRecorder:
             raise DatabentoAccessError(
                 "No enabled CME symbol mapping configured for {}".format(metal)
             )
+        self.provider_approval = require_config_provider_operation(
+            config, "databento", "live"
+        )
         if max_records is not None and max_records < 1:
             raise ValueError("max_records must be at least one")
+        if queue_maxsize < 1:
+            raise ValueError("queue_maxsize must be at least one")
 
         self.config = config
         self.metal = metal
         self.max_records = max_records
+        self.sequencer = sequencer or GlobalReceiveSequencer()
         self.raw_store = PartitionedRawStore(
             Path(config.storage.root),
             fsync_every_records=config.storage.fsync_every_records,
@@ -87,12 +96,11 @@ class DatabentoMetalsRecorder:
         self.run_id = self.raw_store.run_id
         self.quality = QualityTracker()
         self.counts: Dict[str, int] = {"records": 0}
-        self._ingestion_sequence = 0
         self._done = threading.Event()
         self._lock = threading.Lock()
         self._errors: List[BaseException] = []
         self._accepted_records = 0
-        self._record_queue: queue.Queue = queue.Queue(maxsize=100_000)
+        self._record_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
         self._writer_thread: Optional[threading.Thread] = None
         self._native_stream_handle: Optional[BinaryIO] = None
         self._native_stream_path: Optional[Path] = None
@@ -102,9 +110,7 @@ class DatabentoMetalsRecorder:
             api_key = os.environ.get(config.cme.api_key_env, "").strip()
             if not api_key:
                 raise DatabentoAccessError(
-                    "Set {} to a licensed Databento key".format(
-                        config.cme.api_key_env
-                    )
+                    "Set {} to a licensed Databento key".format(config.cme.api_key_env)
                 )
             subscriptions = glbx_metals_subscriptions(
                 product.cme_symbols,
@@ -119,13 +125,22 @@ class DatabentoMetalsRecorder:
                 include_ts_out=config.cme.include_ts_out,
             )
         self.collector = collector
+        manifest_config = config.public_snapshot()
+        manifest_config["collector"] = {
+            "component": "databento_live",
+            "metal": metal,
+            "provider_approval_id": self.provider_approval.approval_id,
+            "read_only": True,
+        }
         write_run_manifest(
-            Path(config.storage.root), self.run_id, config.public_snapshot()
+            Path(config.storage.root),
+            self.run_id,
+            manifest_config,
+            output_paths=(
+                self.provider_approval.approval_path,
+                self.provider_approval.manifest_path,
+            ),
         )
-
-    def _next_ingestion_sequence(self) -> int:
-        self._ingestion_sequence += 1
-        return self._ingestion_sequence
 
     def _enqueue_record(self, record: Any) -> None:
         """Accept a record without blocking Databento's networking loop."""
@@ -136,8 +151,18 @@ class DatabentoMetalsRecorder:
                 and self._accepted_records >= self.max_records
             ):
                 return
+            stream = (
+                str(record.get("schema", "live_callback"))
+                if isinstance(record, dict)
+                else "live_callback"
+            )
+            # This callback is the acceptance boundary. Allocate the global key
+            # before queueing so the writer thread can never reorder or replace it.
+            stamp = self.sequencer.stamp("databento", stream)
             try:
-                self._record_queue.put_nowait(record)
+                self._record_queue.put_nowait(
+                    IngestionItem(stamp=stamp, metal=self.metal, payload=record)
+                )
             except queue.Full:
                 self._errors.append(
                     DatabentoAccessError(
@@ -146,8 +171,28 @@ class DatabentoMetalsRecorder:
                 )
                 self.quality.record("cme_collection_errors")
                 self.quality.record("cme_normalization_queue_overflows")
+                self.quality.record_missing_interval(
+                    "cme",
+                    stamp.receive_ts_ns,
+                    None,
+                    "normalization_queue_overflow",
+                )
+                self.quality.record_missing_interval(
+                    "cme",
+                    stamp.receive_ts_ns,
+                    None,
+                    "cme_collection_error:normalization_queue_overflow",
+                )
                 self._done.set()
                 return
+            if stamp.monotonic_regression:
+                self.quality.record("ingestion_monotonic_regressions")
+                self.quality.record_missing_interval(
+                    "cme",
+                    stamp.receive_ts_ns,
+                    stamp.receive_ts_ns,
+                    "global_monotonic_regression",
+                )
             self._accepted_records += 1
             if (
                 self.max_records is not None
@@ -167,21 +212,27 @@ class DatabentoMetalsRecorder:
             finally:
                 self._record_queue.task_done()
 
-    def _persist_record(self, record: Any) -> None:
+    def _persist_record(self, item: IngestionItem[Any]) -> None:
         """Write extracted JSON and normalized rows on the writer thread."""
 
+        stamp = item.stamp
+        record = item.payload
         if isinstance(record, DeferredDatabentoRecord):
             record = self.collector.normalize_record(
                 record.record,
-                local_receive_ts_ns=record.local_receive_ts_ns,
-                local_monotonic_ts_ns=record.local_monotonic_ts_ns,
+                local_receive_ts_ns=stamp.receive_ts_ns,
+                local_monotonic_ts_ns=stamp.local_monotonic_ts_ns,
             )
-        receive_ts_ns = int(record.get("local_receive_ts_ns") or time.time_ns())
+        receive_ts_ns = stamp.receive_ts_ns
         schema = str(record.get("schema", "unknown"))
         enriched = dict(record)
         enriched["metal"] = self.metal
-        enriched["ingestion_sequence"] = self._next_ingestion_sequence()
+        enriched["ingestion_sequence"] = stamp.ingestion_sequence
         enriched["receive_ts_ns"] = receive_ts_ns
+        enriched["local_receive_ts_ns"] = stamp.receive_ts_ns
+        enriched["local_monotonic_ts_ns"] = stamp.local_monotonic_ts_ns
+        enriched["previous_monotonic_ts_ns"] = stamp.previous_monotonic_ts_ns
+        enriched["monotonic_regression"] = stamp.monotonic_regression
         enriched["source_event_ts_ns"] = record.get("ts_event")
         ts_recv = record.get("ts_recv")
         ts_in_delta = record.get("ts_in_delta")
@@ -241,6 +292,12 @@ class DatabentoMetalsRecorder:
         with self._lock:
             self._errors.append(error)
             self.quality.record("cme_collection_errors")
+            self.quality.record_missing_interval(
+                "cme",
+                time.time_ns(),
+                None,
+                "cme_collection_error",
+            )
             self._done.set()
 
     def _native_path(self) -> Path:
@@ -301,21 +358,38 @@ class DatabentoMetalsRecorder:
                 else None
             )
             while not self._done.is_set():
-                if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                if (
+                    deadline is not None
+                    and asyncio.get_running_loop().time() >= deadline
+                ):
                     break
                 closed, _ = await asyncio.wait((close_task,), timeout=0.05)
                 if close_task in closed:
                     try:
                         await close_task
                     except BaseException as disconnect_error:
+                        disconnect_ts_ns = time.time_ns()
+                        self.quality.record("cme_disconnects")
+                        self.quality.record_missing_interval(
+                            "cme",
+                            disconnect_ts_ns,
+                            None,
+                            "databento_disconnect",
+                        )
                         raise DatabentoAccessError(
                             "Databento feed disconnected unexpectedly: {}".format(
                                 disconnect_error
                             )
                         ) from disconnect_error
-                    raise DatabentoAccessError(
-                        "Databento feed closed unexpectedly"
+                    disconnect_ts_ns = time.time_ns()
+                    self.quality.record("cme_disconnects")
+                    self.quality.record_missing_interval(
+                        "cme",
+                        disconnect_ts_ns,
+                        None,
+                        "databento_disconnect",
                     )
+                    raise DatabentoAccessError("Databento feed closed unexpectedly")
             if self._errors:
                 raise DatabentoAccessError(
                     "Databento collection failed: {}".format(self._errors[0])
@@ -361,6 +435,12 @@ class DatabentoMetalsRecorder:
                     with self._lock:
                         self._errors.append(native_failure)
                         self.quality.record("cme_collection_errors")
+                        self.quality.record_missing_interval(
+                            "cme",
+                            time.time_ns(),
+                            None,
+                            "cme_collection_error:native_stream",
+                        )
             try:
                 await self._finish_writer()
             except BaseException as writer_error:
@@ -398,9 +478,7 @@ class DatabentoMetalsRecorder:
             / "report.json"
         )
 
-    def _finalize(
-        self, status: str, error: Optional[BaseException] = None
-    ) -> None:
+    def _finalize(self, status: str, error: Optional[BaseException] = None) -> None:
         if self._finalized:
             return
         errors: List[BaseException] = list(self._errors)
@@ -436,10 +514,7 @@ class DatabentoMetalsRecorder:
                 status = "failed"
 
         output_paths = self.raw_store.paths + self.normalized_store.paths
-        if (
-            self._native_stream_path is not None
-            and self._native_stream_path.exists()
-        ):
+        if self._native_stream_path is not None and self._native_stream_path.exists():
             output_paths.append(self._native_stream_path)
         if quality_path is not None:
             output_paths.append(quality_path)

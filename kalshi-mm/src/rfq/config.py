@@ -38,15 +38,22 @@ class PricingConfig:
     max_spread_cents: int = 15         # Maximum spread cap (in cents)
     use_bbo_mid: bool = True           # Use BBO mid as primary price source
 
+    # Liquidity requirements for considering a leg "priceable"
+    min_bbo_liquidity_dollars: float = 10.0  # Min $ on each side of BBO
+    max_bbo_spread_cents: int = 20           # Max spread to consider liquid (0 = no limit)
+
 
 @dataclass
 class RiskConfig:
     """Risk management configuration."""
     max_exposure_dollars: float = 1000.0    # Total $ exposure across all active quotes
     max_single_rfq_dollars: float = 200.0   # Max $ on any single RFQ
+    max_quote_cost_dollars: float = 100.0   # Max cost of quote (max(yes,no) * contracts)
     max_contracts_per_rfq: int = 5000       # Hard limit on contracts per RFQ
     max_active_quotes: int = 10             # Concurrent unconfirmed quotes
     position_limit_per_market: int = 1000   # Contracts per underlying market
+    min_edge_cents: int = 0                 # Minimum edge required (in cents, 0 = just positive)
+    one_sided_quotes: bool = True           # Only quote profitable side when one side has negative edge
 
 
 @dataclass
@@ -136,6 +143,8 @@ class RFQConfig:
             min_spread_cents=pricing_data.get("min_spread_cents", 2),
             max_spread_cents=pricing_data.get("max_spread_cents", 15),
             use_bbo_mid=pricing_data.get("use_bbo_mid", True),
+            min_bbo_liquidity_dollars=pricing_data.get("min_bbo_liquidity_dollars", 10.0),
+            max_bbo_spread_cents=pricing_data.get("max_bbo_spread_cents", 20),
         )
 
         # Risk
@@ -143,9 +152,12 @@ class RFQConfig:
         risk = RiskConfig(
             max_exposure_dollars=risk_data.get("max_exposure_dollars", 1000.0),
             max_single_rfq_dollars=risk_data.get("max_single_rfq_dollars", 200.0),
+            max_quote_cost_dollars=risk_data.get("max_quote_cost_dollars", 100.0),
             max_contracts_per_rfq=risk_data.get("max_contracts_per_rfq", 5000),
             max_active_quotes=risk_data.get("max_active_quotes", 10),
             position_limit_per_market=risk_data.get("position_limit_per_market", 1000),
+            min_edge_cents=risk_data.get("min_edge_cents", 0),
+            one_sided_quotes=risk_data.get("one_sided_quotes", True),
         )
 
         # Filters

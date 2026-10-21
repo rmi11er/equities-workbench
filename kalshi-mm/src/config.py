@@ -38,18 +38,18 @@ class StrategyConfig:
     risk_aversion: float = 0.05  # gamma
     gamma: float = 0.05          # alias for risk_aversion (V2)
 
-    # Position limits
-    max_inventory: int = 50
-    max_order_size: int = 50    # fat finger protection
+    # Position limits (in dollars - converted to contracts based on price)
+    max_inventory_dollars: float = 500.0    # max $ exposure per market
+    max_order_size_dollars: float = 50.0    # fat finger protection per order
 
     # Quote generation
     base_spread: float = 2.0     # base spread in cents
     min_absolute_spread: float = 2.0  # minimum spread floor (safety net below Stoikov math)
     max_spread: float = 0.0      # maximum spread ceiling (0 = no ceiling, use for tight quoting in liquid markets)
-    quote_size: int = 50         # default quote size
+    quote_size_dollars: float = 50.0  # dollar amount per quote (converted to contracts based on price)
 
     # Depth-based pricing (V2)
-    effective_depth_contracts: int = 100  # contracts required to define "real" price
+    effective_depth_contracts: int = 500  # contracts required to define "real" price
 
     # Time horizon for expiry urgency
     time_normalization_sec: float = 86400.0  # 1 day - expiries beyond this treated as T-t=1.0
@@ -60,8 +60,8 @@ class StrategyConfig:
     queue_position_threshold: int = 500  # only amend if queue position > this (0 = always amend)
 
     # Liquidity joining - avoid being alone on a price level
-    min_join_depth_dollars: float = 200.0  # min $ of liquidity to join (0 = disabled)
-    allow_solo_if_edge: int = 7       # allow solo if our edge to mid >= this many cents
+    min_join_depth_dollars: float = 1000.0  # min $ of liquidity to join (0 = disabled)
+    allow_solo_if_edge: int = 15      # allow solo if our edge to mid >= this many cents
     max_retreat: int = 15             # max cents to retreat to find joinable level
 
 
@@ -101,6 +101,7 @@ class LoggingConfig:
 class LIPConfig:
     """LIP (Liquidity Incentive Program) configuration."""
     max_tick_cap: int = 20  # never quote more than this many cents away for LIP
+    enforce_min_size: bool = True  # if False, don't bump size up to LIP target_size
 
 
 @dataclass
@@ -134,6 +135,27 @@ class MicrostructureConfig:
 
 
 @dataclass
+class LayeringConfig:
+    """Quote ladder layering configuration (V2.2)."""
+    enabled: bool = True                  # Master switch for layered quoting
+    layer_count: int = 3                  # Number of layers (0=Canary, 1=Body, 2=Wall)
+    base_tick_step: int = 1               # Gap between layers (cents)
+
+    # Sizing ratios relative to base quote size
+    canary_size_ratio: float = 0.5        # Layer 0: smaller to detect sweeps
+    body_size_ratio: float = 1.0          # Layer 1: standard size
+    wall_size_ratio: float = 2.0          # Layer 2: larger for capital preservation
+
+    # Canary tripwire detection
+    canary_timeout_ms: int = 50           # Fill faster than this = toxic sweep
+
+    # High-vol response
+    high_vol_spread_multiplier: float = 2.0  # Tick step multiplier in high-vol
+    wall_only_in_high_vol: bool = True       # Only Layer 2 active in high-vol
+    high_vol_timeout_sec: float = 30.0       # Duration of high-vol state
+
+
+@dataclass
 class PeggedModeConfig:
     """Pegged mode configuration for solved markets (V2)."""
     enabled: bool = False             # Toggle for solved markets mode
@@ -160,6 +182,7 @@ class Config:
     impulse: ImpulseConfig = field(default_factory=ImpulseConfig)
     microstructure: MicrostructureConfig = field(default_factory=MicrostructureConfig)
     pegged_mode: PeggedModeConfig = field(default_factory=PeggedModeConfig)
+    layering: LayeringConfig = field(default_factory=LayeringConfig)
 
     @property
     def tickers(self) -> list:
@@ -215,19 +238,19 @@ class Config:
         strategy = StrategyConfig(
             risk_aversion=strat_data.get("risk_aversion", 0.05),
             gamma=gamma_val,
-            max_inventory=strat_data.get("max_inventory", 500),
-            max_order_size=strat_data.get("max_order_size", 100),
+            max_inventory_dollars=strat_data.get("max_inventory_dollars", 500.0),
+            max_order_size_dollars=strat_data.get("max_order_size_dollars", 50.0),
             base_spread=strat_data.get("base_spread", 2.0),
             min_absolute_spread=strat_data.get("min_absolute_spread", 2.0),
-            quote_size=strat_data.get("quote_size", 10),
+            quote_size_dollars=strat_data.get("quote_size_dollars", 50.0),
             effective_depth_contracts=strat_data.get("effective_depth_contracts", 100),
             time_normalization_sec=strat_data.get("time_normalization_sec", 86400.0),
             debounce_cents=strat_data.get("debounce_cents", 4),
             debounce_seconds=strat_data.get("debounce_seconds", 15.0),
             queue_position_threshold=strat_data.get("queue_position_threshold", 500),
-            min_join_depth_dollars=strat_data.get("min_join_depth_dollars", 25.0),
-            allow_solo_if_edge=strat_data.get("allow_solo_if_edge", 3),
-            max_retreat=strat_data.get("max_retreat", 10),
+            min_join_depth_dollars=strat_data.get("min_join_depth_dollars", 1000.0),
+            allow_solo_if_edge=strat_data.get("allow_solo_if_edge", 15),
+            max_retreat=strat_data.get("max_retreat", 15),
         )
 
         vol_data = data.get("volatility", {})
@@ -254,6 +277,7 @@ class Config:
         lip_data = data.get("lip", {})
         lip_cfg = LIPConfig(
             max_tick_cap=lip_data.get("max_tick_cap", 20),
+            enforce_min_size=lip_data.get("enforce_min_size", True),
         )
 
         # V2 configs
@@ -288,6 +312,20 @@ class Config:
             reload_threshold=pegged_data.get("reload_threshold", 0.8),
         )
 
+        layering_data = data.get("layering", {})
+        layering_cfg = LayeringConfig(
+            enabled=layering_data.get("enabled", True),
+            layer_count=layering_data.get("layer_count", 3),
+            base_tick_step=layering_data.get("base_tick_step", 1),
+            canary_size_ratio=layering_data.get("canary_size_ratio", 0.5),
+            body_size_ratio=layering_data.get("body_size_ratio", 1.0),
+            wall_size_ratio=layering_data.get("wall_size_ratio", 2.0),
+            canary_timeout_ms=layering_data.get("canary_timeout_ms", 50),
+            high_vol_spread_multiplier=layering_data.get("high_vol_spread_multiplier", 2.0),
+            wall_only_in_high_vol=layering_data.get("wall_only_in_high_vol", True),
+            high_vol_timeout_sec=layering_data.get("high_vol_timeout_sec", 30.0),
+        )
+
         # Parse market tickers (multi-market support)
         market_tickers = data.get("market_tickers", [])
         if not isinstance(market_tickers, list):
@@ -307,6 +345,7 @@ class Config:
             impulse=impulse_cfg,
             microstructure=micro_cfg,
             pegged_mode=pegged_cfg,
+            layering=layering_cfg,
         )
 
 

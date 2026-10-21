@@ -6,9 +6,9 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from .config import StrategyConfig
-from .constants import MIN_PRICE, MAX_PRICE
-from .types import StrategyOutput
+from .config import StrategyConfig, LayeringConfig
+from .constants import MIN_PRICE, MAX_PRICE, OrderSide
+from .types import StrategyOutput, QuoteLevel, QuoteLadder, LayerIndex
 
 logger = logging.getLogger(__name__)
 
@@ -211,8 +211,8 @@ class StoikovStrategy:
             bid_price = max(MIN_PRICE, mid_int - 1)
             ask_price = min(MAX_PRICE, mid_int + 1)
 
-        # Compute quote sizes based on inventory
-        bid_size, ask_size = self._compute_sizes(inventory)
+        # Compute quote sizes based on inventory and price (dollar-based sizing)
+        bid_size, ask_size = self._compute_sizes(inventory, bid_price, ask_price)
 
         # Compute inventory skew for logging
         inventory_skew = mid_price - reservation + external_skew
@@ -227,18 +227,44 @@ class StoikovStrategy:
             inventory_skew=inventory_skew,
         )
 
-    def _compute_sizes(self, inventory: int) -> tuple[int, int]:
+    def _compute_sizes(
+        self, inventory: int, bid_price: int, ask_price: int
+    ) -> tuple[int, int]:
         """
-        Compute quote sizes based on inventory.
+        Compute quote sizes based on inventory and price.
+
+        Uses dollar-based sizing: quote_size_dollars is converted to contracts
+        based on the quote price. This ensures equal dollar risk on each side
+        regardless of price level.
+
+        Example with quote_size_dollars=50:
+        - At 1c:  50 / 0.01 = 5000 contracts
+        - At 50c: 50 / 0.50 = 100 contracts
+        - At 99c: 50 / 0.99 = 50 contracts
 
         When inventory is high, reduce bid size to slow accumulation.
         When inventory is low (negative), reduce ask size.
         """
-        base_size = self.config.quote_size
-        max_inv = self.config.max_inventory
+        quote_dollars = self.config.quote_size_dollars
+        max_inv_dollars = self.config.max_inventory_dollars
+        max_order_dollars = self.config.max_order_size_dollars
+
+        # Convert dollars to contracts based on price
+        # contracts = dollars / (price_cents / 100)
+        bid_base = int(quote_dollars / (bid_price / 100)) if bid_price > 0 else 1
+        ask_base = int(quote_dollars / (ask_price / 100)) if ask_price > 0 else 1
+
+        # Convert max limits to contracts at mid price (average of bid/ask)
+        mid_price = (bid_price + ask_price) / 2
+        max_inv_contracts = int(max_inv_dollars / (mid_price / 100)) if mid_price > 0 else 1000
+        max_order_contracts = int(max_order_dollars / (bid_price / 100)) if bid_price > 0 else 100
+
+        # Ensure at least 1 contract
+        bid_base = max(1, bid_base)
+        ask_base = max(1, ask_base)
 
         # Inventory ratio: -1 to 1
-        inv_ratio = inventory / max_inv if max_inv > 0 else 0
+        inv_ratio = inventory / max_inv_contracts if max_inv_contracts > 0 else 0
 
         # Scale sizes inversely with inventory
         # High positive inventory -> smaller bids, normal asks
@@ -250,29 +276,200 @@ class StoikovStrategy:
             bid_scale = 1.0
             ask_scale = max(0.1, 1 + inv_ratio)
 
-        bid_size = max(1, int(base_size * bid_scale))
-        ask_size = max(1, int(base_size * ask_scale))
+        bid_size = max(1, int(bid_base * bid_scale))
+        ask_size = max(1, int(ask_base * ask_scale))
 
-        # Apply fat finger limit
-        bid_size = min(bid_size, self.config.max_order_size)
-        ask_size = min(ask_size, self.config.max_order_size)
+        # Apply fat finger limit (converted to contracts)
+        bid_size = min(bid_size, max_order_contracts)
+        max_ask_contracts = int(max_order_dollars / (ask_price / 100)) if ask_price > 0 else 100
+        ask_size = min(ask_size, max(1, max_ask_contracts))
 
         return bid_size, ask_size
 
-    def should_quote(self, inventory: int) -> tuple[bool, bool]:
+    def generate_ladder(
+        self,
+        mid_price: float,
+        inventory: int,
+        volatility: float,
+        layering_config: LayeringConfig,
+        is_high_vol: bool = False,
+        external_skew: float = 0.0,
+        expiry_ts: Optional[float] = None,
+    ) -> QuoteLadder:
+        """
+        Generate a multi-layer quote ladder.
+
+        In Normal mode: full 3-layer ladder (Canary + Body + Wall)
+        In High-Vol mode: Wall-only with wider spacing
+
+        Args:
+            mid_price: Current mid price (cents)
+            inventory: Current position (positive = long YES)
+            volatility: Realized volatility estimate (cents)
+            layering_config: LayeringConfig with layer parameters
+            is_high_vol: True if in high-vol regime (Wall-only mode)
+            external_skew: Additional skew from alpha engine (cents)
+            expiry_ts: Market expiration Unix timestamp
+
+        Returns:
+            QuoteLadder with bid and ask levels
+        """
+        if not layering_config.enabled:
+            # Fallback to single quote mode
+            output = self.generate_quotes(
+                mid_price=mid_price,
+                inventory=inventory,
+                volatility=volatility,
+                external_skew=external_skew,
+                expiry_ts=expiry_ts,
+            )
+            # Convert StrategyOutput to QuoteLadder with single level
+            bid = QuoteLevel(
+                price=output.bid_price,
+                size=output.bid_size,
+                layer_index=LayerIndex.BODY,
+                is_active=True,
+                side=OrderSide.BUY,
+            )
+            ask = QuoteLevel(
+                price=output.ask_price,
+                size=output.ask_size,
+                layer_index=LayerIndex.BODY,
+                is_active=True,
+                side=OrderSide.SELL,
+            )
+            return QuoteLadder(
+                bids=[bid],
+                asks=[ask],
+                reservation_price=output.reservation_price,
+            )
+
+        # Calculate dynamic time horizon based on expiry
+        time_horizon = calculate_time_horizon(
+            expiry_ts,
+            normalization_sec=self.config.time_normalization_sec,
+        )
+
+        params = StoikovParams(
+            mid_price=mid_price,
+            inventory=inventory,
+            volatility=volatility,
+            gamma=self.config.risk_aversion,
+            time_horizon=time_horizon,
+            min_spread=self.config.min_absolute_spread,
+            max_spread=self.config.max_spread,
+        )
+
+        # Compute reservation price
+        reservation = self.compute_reservation_price(params)
+        reservation += external_skew
+
+        # Compute base spread
+        spread = self.compute_spread(params)
+
+        # Anchor prices (Layer 0 = Canary at tightest spread)
+        anchor_bid = math.floor(reservation - spread / 2)
+        anchor_ask = math.ceil(reservation + spread / 2)
+
+        # Ensure no cross
+        if anchor_bid >= anchor_ask:
+            anchor_bid = math.floor(reservation - 0.5)
+            anchor_ask = math.ceil(reservation + 0.5)
+
+        # Determine tick step and active layers based on regime
+        if is_high_vol:
+            tick_step = int(layering_config.base_tick_step * layering_config.high_vol_spread_multiplier)
+            active_layers = {LayerIndex.WALL} if layering_config.wall_only_in_high_vol else {0, 1, 2}
+        else:
+            tick_step = layering_config.base_tick_step
+            active_layers = {LayerIndex.CANARY, LayerIndex.BODY, LayerIndex.WALL}
+
+        # Size ratios per layer
+        size_ratios = {
+            LayerIndex.CANARY: layering_config.canary_size_ratio,
+            LayerIndex.BODY: layering_config.body_size_ratio,
+            LayerIndex.WALL: layering_config.wall_size_ratio,
+        }
+
+        # Compute base sizes at anchor prices
+        base_bid_size, base_ask_size = self._compute_sizes(inventory, anchor_bid, anchor_ask)
+
+        bids = []
+        asks = []
+
+        for layer_idx in range(layering_config.layer_count):
+            is_active = layer_idx in active_layers
+
+            # Calculate price offset from anchor
+            # Layer 0 = anchor, Layer 1 = anchor - step, Layer 2 = anchor - 2*step
+            bid_price = anchor_bid - (layer_idx * tick_step)
+            ask_price = anchor_ask + (layer_idx * tick_step)
+
+            # Clamp to valid range
+            bid_price = max(MIN_PRICE, min(MAX_PRICE - 1, bid_price))
+            ask_price = max(MIN_PRICE + 1, min(MAX_PRICE, ask_price))
+
+            # Compute size for this layer
+            ratio = size_ratios.get(layer_idx, 1.0)
+            bid_size = max(1, int(base_bid_size * ratio))
+            ask_size = max(1, int(base_ask_size * ratio))
+
+            bids.append(QuoteLevel(
+                price=bid_price,
+                size=bid_size,
+                layer_index=layer_idx,
+                is_active=is_active,
+                side=OrderSide.BUY,
+            ))
+
+            asks.append(QuoteLevel(
+                price=ask_price,
+                size=ask_size,
+                layer_index=layer_idx,
+                is_active=is_active,
+                side=OrderSide.SELL,
+            ))
+
+        return QuoteLadder(
+            bids=bids,
+            asks=asks,
+            reservation_price=reservation,
+        )
+
+    def should_quote(self, inventory: int, mid_price: float = 50.0) -> tuple[bool, bool]:
         """
         Determine if we should quote bid/ask based on inventory limits.
+
+        Args:
+            inventory: Current position in contracts (+ = long YES, - = short YES/long NO)
+            mid_price: Current YES mid price (used for dollar exposure calculation)
 
         Returns:
             (should_bid, should_ask)
         """
-        max_inv = self.config.max_inventory
+        # Calculate current dollar exposure at current price
+        # Long YES: use YES price
+        # Short YES (long NO): use NO price = 100 - YES price
+        if inventory >= 0:
+            price_for_exposure = mid_price
+        else:
+            price_for_exposure = 100.0 - mid_price  # NO price
 
-        # Don't bid if at max long position
-        should_bid = inventory < max_inv
+        current_exposure_dollars = abs(inventory) * (price_for_exposure / 100)
 
-        # Don't ask if at max short position
-        should_ask = inventory > -max_inv
+        # Compare against dollar limit directly
+        max_dollars = self.config.max_inventory_dollars
+
+        # Don't bid if long exposure >= max
+        # Don't ask if short exposure >= max
+        if inventory >= 0:
+            # Long YES position - check if we can add more longs
+            should_bid = current_exposure_dollars < max_dollars
+            should_ask = True  # Can always sell when long
+        else:
+            # Short YES position (long NO) - check if we can add more shorts
+            should_bid = True  # Can always buy when short
+            should_ask = current_exposure_dollars < max_dollars
 
         return should_bid, should_ask
 

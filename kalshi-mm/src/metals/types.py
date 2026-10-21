@@ -40,6 +40,8 @@ class SourceEnvelope:
     subscription_id: Optional[str] = None
     sequence_status: Optional[str] = None
     gap_flag: bool = False
+    previous_monotonic_ts_ns: Optional[int] = None
+    monotonic_regression: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -59,6 +61,8 @@ class MarketMetadataVersion:
     strike_type: Optional[str]
     settlement_source_name: Optional[str]
     settlement_source_url: Optional[str]
+    rules_primary: Optional[str]
+    rules_secondary: Optional[str]
     pyth_symbol: Optional[str]
     pyth_feed_id: Optional[str]
     price_level_structure: Optional[str]

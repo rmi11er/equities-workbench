@@ -11,7 +11,7 @@ from typing import Optional, TYPE_CHECKING
 from .config import StrategyConfig
 from .connector import KalshiConnector, APIError, RateLimitError
 from .constants import OrderSide, OrderStatus
-from .types import Order, StrategyOutput
+from .types import Order, StrategyOutput, QuoteLadder, QuoteLevel, LayerIndex
 from .volatility_regime import VolatilityRegime
 
 if TYPE_CHECKING:
@@ -48,6 +48,48 @@ class QuoteState:
     last_ask_price: Optional[int] = None
 
 
+@dataclass
+class LayeredQuoteState:
+    """Current state of our multi-layer quotes in the market."""
+    # Layer index -> Order
+    bid_orders: dict[int, Order] = field(default_factory=dict)
+    ask_orders: dict[int, Order] = field(default_factory=dict)
+    last_update: float = 0.0
+    last_reservation_price: Optional[float] = None
+
+    def get_bid(self, layer_index: int) -> Optional[Order]:
+        """Get bid order for a layer."""
+        return self.bid_orders.get(layer_index)
+
+    def get_ask(self, layer_index: int) -> Optional[Order]:
+        """Get ask order for a layer."""
+        return self.ask_orders.get(layer_index)
+
+    def set_bid(self, layer_index: int, order: Optional[Order]) -> None:
+        """Set bid order for a layer."""
+        if order is None:
+            self.bid_orders.pop(layer_index, None)
+        else:
+            self.bid_orders[layer_index] = order
+
+    def set_ask(self, layer_index: int, order: Optional[Order]) -> None:
+        """Set ask order for a layer."""
+        if order is None:
+            self.ask_orders.pop(layer_index, None)
+        else:
+            self.ask_orders[layer_index] = order
+
+    @property
+    def all_bid_orders(self) -> list[Order]:
+        """Get all active bid orders."""
+        return [o for o in self.bid_orders.values() if o and o.is_active]
+
+    @property
+    def all_ask_orders(self) -> list[Order]:
+        """Get all active ask orders."""
+        return [o for o in self.ask_orders.values() if o and o.is_active]
+
+
 class ExecutionEngine:
     """
     Manages order execution with diff-based updates and debouncing.
@@ -74,8 +116,11 @@ class ExecutionEngine:
         self.max_consecutive_errors = max_consecutive_errors
         self.volatility_regime = volatility_regime
 
-        # State per ticker
+        # State per ticker (single-layer mode)
         self._quotes: dict[str, QuoteState] = {}
+
+        # State per ticker (multi-layer mode)
+        self._layered_quotes: dict[str, LayeredQuoteState] = {}
 
         # P&L tracking
         self._realized_pnl: float = 0.0
@@ -679,15 +724,26 @@ class ExecutionEngine:
                 except APIError as e:
                     logger.error(f"Amend failed: {e}")
                     self.record_api_error()
-                    # On failure, cancel and recreate
-                    # Always clear state - if amend failed, order may be gone (filled/cancelled)
+                    # On failure, try to cancel and recreate
+                    # But ONLY clear state if cancel succeeds or order is already gone (404)
                     try:
                         await self.connector.cancel_order(diff.order_id)
-                    except APIError:
-                        # Cancel failed too (order already gone) - that's fine
-                        pass
-                    # Clear state regardless so we don't keep trying to amend a dead order
-                    setattr(state, attr, None)
+                        # Cancel succeeded - safe to clear state
+                        setattr(state, attr, None)
+                        logger.info(f"Cancelled order {diff.order_id} after amend failure")
+                    except APIError as cancel_err:
+                        if cancel_err.status == 404:
+                            # Order already gone (filled/cancelled) - safe to clear state
+                            setattr(state, attr, None)
+                            logger.info(f"Order {diff.order_id} already gone after amend failure")
+                        else:
+                            # Cancel failed for other reason (rate limit, etc.)
+                            # DO NOT clear state - order likely still exists!
+                            # Keep tracking it so we don't create duplicates
+                            logger.warning(
+                                f"Cancel failed after amend failure ({cancel_err}), "
+                                f"keeping order {diff.order_id} in state to avoid duplicates"
+                            )
 
         # Execute creates
         for diff, attr, side_str in [
@@ -814,6 +870,341 @@ class ExecutionEngine:
         self.mark_updated(ticker, target)
 
     # -------------------------------------------------------------------------
+    # Multi-Layer Quote Management (v2.2)
+    # -------------------------------------------------------------------------
+
+    def get_layered_quote_state(self, ticker: str) -> LayeredQuoteState:
+        """Get or create layered quote state for a ticker."""
+        if ticker not in self._layered_quotes:
+            self._layered_quotes[ticker] = LayeredQuoteState()
+        return self._layered_quotes[ticker]
+
+    async def update_ladder(
+        self,
+        ticker: str,
+        ladder: QuoteLadder,
+        should_bid: bool = True,
+        should_ask: bool = True,
+        force: bool = False,
+    ) -> None:
+        """
+        Update quotes to match target ladder (multi-layer mode).
+
+        This reconciles the desired ladder state with current open orders,
+        handling layer activation/deactivation transitions.
+
+        Args:
+            ticker: Market ticker
+            ladder: Target QuoteLadder from strategy
+            should_bid: Whether to maintain bids (inventory permitting)
+            should_ask: Whether to maintain asks (inventory permitting)
+            force: Skip debouncing check
+        """
+        state = self.get_layered_quote_state(ticker)
+        now = time.monotonic()
+
+        # Simple debouncing: check time since last update
+        time_elapsed = now - state.last_update
+        if not force and time_elapsed < self.config.debounce_seconds:
+            # Check for significant price change
+            if state.last_reservation_price is not None:
+                price_delta = abs(ladder.reservation_price - state.last_reservation_price)
+                if price_delta < self.config.debounce_cents:
+                    return
+
+        # Process each bid layer
+        for quote_level in ladder.bids:
+            await self._reconcile_layer(
+                ticker=ticker,
+                state=state,
+                level=quote_level,
+                is_bid=True,
+                should_quote=should_bid,
+            )
+
+        # Process each ask layer
+        for quote_level in ladder.asks:
+            await self._reconcile_layer(
+                ticker=ticker,
+                state=state,
+                level=quote_level,
+                is_bid=False,
+                should_quote=should_ask,
+            )
+
+        # Update state
+        state.last_update = now
+        state.last_reservation_price = ladder.reservation_price
+
+    async def _reconcile_layer(
+        self,
+        ticker: str,
+        state: LayeredQuoteState,
+        level: QuoteLevel,
+        is_bid: bool,
+        should_quote: bool,
+    ) -> None:
+        """
+        Reconcile a single layer with its current order state.
+
+        Handles:
+        - Active layer with no order -> CREATE
+        - Active layer with order at different price/size -> AMEND
+        - Inactive layer with order -> CANCEL
+        - Active layer but should_quote=False -> CANCEL
+        """
+        layer_idx = level.layer_index
+        current_order = state.get_bid(layer_idx) if is_bid else state.get_ask(layer_idx)
+        side_str = "bid" if is_bid else "ask"
+
+        # Should this layer have an order?
+        should_have_order = level.is_active and should_quote and level.size > 0
+
+        # Case 1: Layer should NOT have an order
+        if not should_have_order:
+            if current_order and current_order.is_active:
+                # Cancel existing order
+                try:
+                    await self.connector.cancel_order(current_order.order_id)
+                    logger.info(f"Cancelled L{layer_idx} {side_str} order {current_order.order_id} (layer inactive)")
+                    self.record_api_success()
+                except APIError as e:
+                    if e.status != 404:  # Order already gone is OK
+                        logger.error(f"Failed to cancel L{layer_idx} {side_str}: {e}")
+                        self.record_api_error()
+                finally:
+                    # Clear state regardless
+                    if is_bid:
+                        state.set_bid(layer_idx, None)
+                    else:
+                        state.set_ask(layer_idx, None)
+            return
+
+        # Case 2: Layer SHOULD have an order
+        # Apply depth-based retreat logic
+        adjusted_price = self.find_joinable_price(
+            ticker=ticker,
+            target_price=level.price,
+            is_bid=is_bid,
+        )
+
+        if adjusted_price is None:
+            # No joinable level found - cancel existing if any
+            if current_order and current_order.is_active:
+                try:
+                    await self.connector.cancel_order(current_order.order_id)
+                    logger.info(f"Cancelled L{layer_idx} {side_str}: no joinable level found")
+                except APIError:
+                    pass
+                if is_bid:
+                    state.set_bid(layer_idx, None)
+                else:
+                    state.set_ask(layer_idx, None)
+            return
+
+        # Case 2a: No current order -> CREATE
+        if current_order is None or not current_order.is_active:
+            await self._create_layer_order(
+                ticker=ticker,
+                state=state,
+                layer_idx=layer_idx,
+                is_bid=is_bid,
+                price=adjusted_price,
+                size=level.size,
+            )
+            return
+
+        # Case 2b: Order exists -> check if AMEND needed
+        price_changed = current_order.price != adjusted_price
+        size_changed = current_order.remaining != level.size
+
+        if not price_changed and not size_changed:
+            return  # No change needed
+
+        # Check debounce threshold for amends
+        price_delta = abs(adjusted_price - current_order.price)
+        if price_delta < self.config.debounce_cents:
+            # Small change - could check queue position here
+            # For now, skip small changes to preserve queue priority
+            return
+
+        await self._amend_layer_order(
+            ticker=ticker,
+            state=state,
+            layer_idx=layer_idx,
+            is_bid=is_bid,
+            order=current_order,
+            new_price=adjusted_price,
+            new_size=level.size,
+        )
+
+    async def _create_layer_order(
+        self,
+        ticker: str,
+        state: LayeredQuoteState,
+        layer_idx: int,
+        is_bid: bool,
+        price: int,
+        size: int,
+    ) -> None:
+        """Create a new order for a layer."""
+        side_str = "yes" if is_bid else "no"
+        api_price = price if is_bid else (100 - price)
+
+        # Validate
+        is_valid, error_msg = self.validate_order(ticker, side_str, api_price)
+        if not is_valid:
+            logger.warning(f"L{layer_idx} {'bid' if is_bid else 'ask'} skipped: {error_msg}")
+            return
+
+        try:
+            resp = await self.connector.create_order(
+                ticker=ticker,
+                side=side_str,
+                price=api_price,
+                count=size,
+            )
+
+            order_data = resp.get("order", resp)
+            order = Order(
+                order_id=order_data["order_id"],
+                ticker=ticker,
+                side=OrderSide.BUY if is_bid else OrderSide.SELL,
+                price=price,
+                size=size,
+                remaining=size,
+                filled=0,
+                status=OrderStatus.RESTING,
+                client_order_id=order_data.get("client_order_id"),
+                layer_index=layer_idx,
+            )
+
+            if is_bid:
+                state.set_bid(layer_idx, order)
+            else:
+                state.set_ask(layer_idx, order)
+
+            layer_name = {0: "CANARY", 1: "BODY", 2: "WALL"}.get(layer_idx, f"L{layer_idx}")
+            logger.info(
+                f"Created {layer_name} {'bid' if is_bid else 'ask'} {size}@{price} "
+                f"(order {order.order_id})"
+            )
+            self.record_api_success()
+
+        except APIError as e:
+            logger.error(f"Failed to create L{layer_idx} {'bid' if is_bid else 'ask'}: {e}")
+            self.record_api_error()
+
+    async def _amend_layer_order(
+        self,
+        ticker: str,
+        state: LayeredQuoteState,
+        layer_idx: int,
+        is_bid: bool,
+        order: Order,
+        new_price: int,
+        new_size: int,
+    ) -> None:
+        """Amend an existing layer order."""
+        side_str = "yes" if is_bid else "no"
+        api_price = new_price if is_bid else (100 - new_price)
+
+        if not order.client_order_id:
+            # Can't amend without client_order_id - cancel and recreate
+            logger.warning(f"No client_order_id for L{layer_idx}, cancelling and recreating")
+            try:
+                await self.connector.cancel_order(order.order_id)
+            except APIError:
+                pass
+            if is_bid:
+                state.set_bid(layer_idx, None)
+            else:
+                state.set_ask(layer_idx, None)
+            await self._create_layer_order(ticker, state, layer_idx, is_bid, new_price, new_size)
+            return
+
+        try:
+            resp = await self.connector.amend_order(
+                order_id=order.order_id,
+                ticker=ticker,
+                side=side_str,
+                client_order_id=order.client_order_id,
+                price=api_price,
+                count=new_size,
+            )
+
+            # Update order state
+            order.price = new_price
+            order.remaining = new_size
+            if "updated_client_order_id" in resp:
+                order.client_order_id = resp["updated_client_order_id"]
+
+            layer_name = {0: "CANARY", 1: "BODY", 2: "WALL"}.get(layer_idx, f"L{layer_idx}")
+            logger.info(f"Amended {layer_name} {'bid' if is_bid else 'ask'} to {new_size}@{new_price}")
+            self.record_api_success()
+
+        except APIError as e:
+            logger.error(f"Failed to amend L{layer_idx}: {e}")
+            self.record_api_error()
+            # Try to cancel and recreate
+            try:
+                await self.connector.cancel_order(order.order_id)
+                if is_bid:
+                    state.set_bid(layer_idx, None)
+                else:
+                    state.set_ask(layer_idx, None)
+            except APIError:
+                pass
+
+    def handle_layer_fill(
+        self,
+        ticker: str,
+        order_id: str,
+        side: OrderSide,
+        price: int,
+        size: int,
+        inventory_before: int = 0,
+    ) -> Optional[int]:
+        """
+        Handle a fill on a layered order.
+
+        Returns:
+            The layer_index of the filled order, or None if not found
+        """
+        state = self._layered_quotes.get(ticker)
+        if not state:
+            return None
+
+        # Find the order in our state
+        filled_layer = None
+        for layer_idx, order in list(state.bid_orders.items()):
+            if order and order.order_id == order_id:
+                order.filled += size
+                order.remaining -= size
+                if order.remaining <= 0:
+                    order.status = OrderStatus.EXECUTED
+                    state.set_bid(layer_idx, None)
+                filled_layer = layer_idx
+                break
+
+        if filled_layer is None:
+            for layer_idx, order in list(state.ask_orders.items()):
+                if order and order.order_id == order_id:
+                    order.filled += size
+                    order.remaining -= size
+                    if order.remaining <= 0:
+                        order.status = OrderStatus.EXECUTED
+                        state.set_ask(layer_idx, None)
+                    filled_layer = layer_idx
+                    break
+
+        if filled_layer is not None:
+            layer_name = {0: "CANARY", 1: "BODY", 2: "WALL"}.get(filled_layer, f"L{filled_layer}")
+            logger.info(f"Fill on {layer_name}: {side.value} {size}@{price} (order {order_id})")
+
+        return filled_layer
+
+    # -------------------------------------------------------------------------
     # Emergency Actions
     # -------------------------------------------------------------------------
 
@@ -888,8 +1279,10 @@ class ExecutionEngine:
         # Clear our state regardless of success (assume orders may be gone)
         if ticker:
             self._quotes.pop(ticker, None)
+            self._layered_quotes.pop(ticker, None)
         else:
             self._quotes.clear()
+            self._layered_quotes.clear()
 
     async def pull_quotes(self, ticker: str) -> None:
         """Pull quotes for a specific ticker (data stale, etc.)."""

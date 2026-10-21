@@ -16,6 +16,8 @@ def _market():
         "strike_type": "greater_or_equal",
         "settlement_source_name": "Pyth - Silver",
         "settlement_source_url": "https://app.pyth.com/explore/Metal.Index.SILVER%2FUSD",
+        "rules_primary": "Silver final is at least its opening Pyth value.",
+        "rules_secondary": "Use the preceding minute close and round to 3 decimals.",
         "pyth_symbol": "Metal.Index.SILVER/USD",
         "price_level_structure": "tapered_deci_cent",
         "price_ranges": [{"start": "0.0000", "end": "0.1000", "step": "0.0010"}],
@@ -25,12 +27,18 @@ def _market():
 
 def test_metadata_uses_exact_target_nested_round_digits_and_no_fake_determination():
     version = normalize_market_metadata(
-        _market(), "silver", receive_ts_ns=123, metadata_version=1, fractional_capability=True
+        _market(),
+        "silver",
+        receive_ts_ns=123,
+        metadata_version=1,
+        fractional_capability=True,
     )
 
     assert version.target_price == "66.516"
     assert version.round_digits == 3
     assert version.strike_type == "greater_or_equal"
+    assert version.rules_primary == _market()["rules_primary"]
+    assert version.rules_secondary == _market()["rules_secondary"]
     assert version.determination_ts_ns is None
     assert version.fractional_enabled is True
     assert "determination_ts_ns" not in version.missing_required_fields
@@ -50,3 +58,9 @@ def test_registry_versions_only_rule_relevant_changes():
     second, changed = registry.observe(updated, "silver", 300)
     assert changed and second.metadata_version == 2
     assert second.metadata_hash != first.metadata_hash
+
+    updated_rules = _market()
+    updated_rules["rules_secondary"] = "Use the preceding minute close; revised text."
+    third, changed = registry.observe(updated_rules, "silver", 400)
+    assert changed and third.metadata_version == 3
+    assert third.metadata_hash != first.metadata_hash

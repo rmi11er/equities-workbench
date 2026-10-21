@@ -1,0 +1,151 @@
+{
+  "schema_version": "metals-research-design/v1",
+  "design_version": "metals-forward-panel-2026-08-30-v1",
+  "frozen_at": "2026-08-30T19:24:25Z",
+  "research_only": true,
+  "no_live": true,
+  "no_orders": true,
+  "label_contract": {
+    "provisional_exchange_reported": {
+      "label_name": "exchange_reported_binary_settlement",
+      "status": "provisional",
+      "source_stream": "kalshi_settlement",
+      "value_field": "result",
+      "availability_time_field": "receive_ts_ns",
+      "encoding": {"yes": 1, "no": 0},
+      "construction_uses_exact_pyth": false,
+      "eligible_as_training_label": false,
+      "permitted_use": "plumbing_and_discrepancy_audit_only"
+    },
+    "independently_reconstructed_exact_pyth": {
+      "label_name": "independently_reconstructed_exact_pyth_settlement",
+      "status": "authoritative_research_label_after_exact_audit",
+      "source_audit_stream": "settlement_check",
+      "source_audit_schema": "metals-settlement-audit/v2",
+      "raw_price_stream": "pyth_exact_history",
+      "raw_price_field": "price",
+      "timestamp_field": "publish_timestamp_us",
+      "decision_observation_rule": "last_publication_strictly_before_decision_time",
+      "final_observation_rule": "last_publication_strictly_before_window_close",
+      "return_label_name": "pyth_raw_log_return_to_settlement",
+      "return_formula": "ln(final_raw_pyth_value/decision_raw_pyth_value)",
+      "opening_target_rule": "round_half_up(opening_raw_pyth_value,round_digits)",
+      "final_value_rule": "round_half_up(final_raw_pyth_value,round_digits)",
+      "strike_source_stream": "market_dim",
+      "strike_field": "target_price",
+      "comparison_operator": "greater_or_equal",
+      "rounding_digits_field": "round_digits",
+      "rounding_modes_by_series": {
+        "KXGOLD15M": "half_up",
+        "KXSILVER15M": "half_up"
+      },
+      "settlement_encoding": {"yes": 1, "no": 0},
+      "construction_uses_exchange_result": false,
+      "eligibility_gate": "audit_usable_and_target_value_result_agreements_all_true"
+    }
+  },
+  "observation_unit": {
+    "unit": "complete_kalshi_window",
+    "group_key": ["series_ticker", "market_ticker", "open_ts_ns", "close_ts_ns"],
+    "atomic_split_assignment": true,
+    "required_terminal_streams": ["market_dim", "kalshi_settlement"],
+    "completeness_rule": "one_canonical_metadata_one_final_settlement",
+    "partial_window_action": "exclude"
+  },
+  "splits": {
+    "time_basis": "UTC",
+    "boundary_convention": "[start,end)",
+    "engineering_burn_in": {
+      "start": "2026-08-31T00:00:00Z",
+      "end": "2026-09-14T00:00:00Z"
+    },
+    "minimum_complete_burn_in_trading_days": 10,
+    "engineering_burn_in_use": "plumbing_only_not_model_selection",
+    "intervals": {
+      "research": {
+        "start": "2026-09-14T00:00:00Z",
+        "end": "2026-10-26T00:00:00Z"
+      },
+      "validation": {
+        "start": "2026-10-26T00:00:00Z",
+        "end": "2026-11-16T00:00:00Z"
+      },
+      "final_holdout": {
+        "start": "2026-11-16T00:00:00Z",
+        "end": "2026-12-07T00:00:00Z"
+      }
+    }
+  },
+  "leakage_control": {
+    "forward_label_horizons_seconds": [1, 5, 30, 60, 300, 900],
+    "max_forward_label_horizon_seconds": 900,
+    "max_order_lifetime_seconds": 900,
+    "embargo_seconds": 900,
+    "purge_rule": "exclude_window_if_any_forward_label_or_order_lifetime_crosses_split_end",
+    "embargo_rule": "exclude_windows_opening_before_split_start_plus_embargo_except_research"
+  },
+  "confidence_intervals": {
+    "block_unit": "UTC_trading_day",
+    "window_to_block_rule": "UTC_calendar_date_of_window_open",
+    "interval_level": "95_percent",
+    "resampling_method": "cluster_bootstrap_complete_UTC_trading_days",
+    "report_effective_day_and_window_counts": true
+  },
+  "final_holdout_policy": {
+    "status": "sealed_unread",
+    "records_read_before_unseal": 0,
+    "metrics_read_before_unseal": 0,
+    "selection_use_before_unseal": "forbidden",
+    "explicit_unseal_authorization_required": true,
+    "unseal_prerequisites": [
+      "external_fair_model_frozen",
+      "signal_set_frozen",
+      "execution_model_frozen",
+      "quote_eligibility_rules_frozen",
+      "risk_policy_frozen"
+    ]
+  },
+  "preexisting_data_policy": {
+    "interval": {
+      "start": "2026-07-31T00:00:00Z",
+      "end": "2026-08-31T00:00:00Z"
+    },
+    "designation": "research_and_plumbing_only",
+    "eligible_for_final_holdout": false,
+    "eligible_for_trading_claim": false
+  },
+  "assumptions": {
+    "version": "metals-research-assumptions-2026-08-30-v1",
+    "items": [
+      {
+        "id": "A1",
+        "statement": "Historical Pyth publication timestamps define noncausal labels only and do not assert live-time availability."
+      },
+      {
+        "id": "A2",
+        "statement": "Half-up opening and final rounding and strict-before-boundary selection remain provisional until exact settlement audit agreement is complete."
+      },
+      {
+        "id": "A3",
+        "statement": "A complete provisional plumbing window requires canonical metadata and one final exchange settlement; exact-label eligibility separately requires a usable independent exact-Pyth audit."
+      }
+    ]
+  },
+  "limitations": {
+    "version": "metals-research-limitations-2026-08-30-v1",
+    "items": [
+      {
+        "id": "L1",
+        "statement": "Historical exploratory results cannot establish live latency, queue position, fill probability, or executable profit."
+      },
+      {
+        "id": "L2",
+        "statement": "The first twelve-week panel may not span enough volatility, macro-event, or liquidity regimes for a trading claim."
+      },
+      {
+        "id": "L3",
+        "statement": "Provider contractual permissions are operating assumptions outside this statistical design and are not certified by this artifact."
+      }
+    ]
+  }
+}

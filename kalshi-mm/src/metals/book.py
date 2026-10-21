@@ -89,7 +89,9 @@ class FixedPointOrderBook:
         ask = self.best_yes_ask()
         if bid is None or ask is None:
             return False
-        return Decimal("0") < bid < ask < Decimal("1")
+        # A zero-spread (locked) complementary book can occur near resolution.
+        # It remains reconstructable even though quote policy must not join it.
+        return Decimal("0") < bid <= ask < Decimal("1")
 
     def state_hash(self) -> str:
         payload = {

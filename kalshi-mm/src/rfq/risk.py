@@ -239,6 +239,13 @@ class RiskManager:
         """Get an active quote by ID."""
         return self._active_quotes.get(quote_id)
 
+    def find_quote_by_rfq(self, rfq_id: str) -> Optional[ActiveQuote]:
+        """Find an active quote by RFQ ID."""
+        for quote in self._active_quotes.values():
+            if quote.rfq_id == rfq_id:
+                return quote
+        return None
+
     def get_active_quotes(self) -> list[ActiveQuote]:
         """Get all active quotes."""
         return list(self._active_quotes.values())

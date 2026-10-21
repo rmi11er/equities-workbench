@@ -1,0 +1,26 @@
+{
+  "schema_version": "metals-settlement-semantics/v2",
+  "timestamp": {
+    "version": "replace-with-reviewed-evidence-version",
+    "confirmed": false,
+    "evidence_sha256": null
+  },
+  "correction": {
+    "version": "replace-with-reviewed-evidence-version",
+    "confirmed": false,
+    "evidence_sha256": null
+  },
+  "rounding": {
+    "version": "replace-with-reviewed-evidence-version",
+    "confirmed": false,
+    "evidence_sha256": null
+  },
+  "timestamp_field": "publish_timestamp_us",
+  "timestamp_meaning": "last_publication_strictly_before_boundary",
+  "timestamp_source_label": "publish_time_and_feed_update_timestamp_microseconds",
+  "correction_policy": "last_publication_before_boundary_v1",
+  "rounding_modes_by_series": {
+    "KXGOLD15M": "half_up",
+    "KXSILVER15M": "half_up"
+  }
+}

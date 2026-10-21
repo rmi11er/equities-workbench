@@ -1,0 +1,48 @@
+# Read-only KXBTC15M comparison/control for the metals toxicity study.
+# This uses a separate storage root and cannot route live orders.
+
+environment = "production"
+
+[storage]
+root = "data/btc-control"
+fsync_every_records = 100
+
+[kalshi]
+rest_url = "https://external-api.kalshi.com/trade-api/v2"
+ws_url = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+credentials_config = "config.toml"
+api_key_id_env = "KALSHI_API_KEY_ID"
+private_key_path_env = "KALSHI_PRIVATE_KEY_PATH"
+page_limit = 1000
+discovery_interval_seconds = 15.0
+request_timeout_seconds = 30.0
+fractional_contracts_enabled = true
+fractional_contract_quantum = "0.01"
+upcoming_markets_per_product = 4
+max_read_requests_per_second = 18.0
+max_read_retries = 5
+read_retry_base_seconds = 0.25
+
+[pyth]
+enabled = false
+
+[cme]
+enabled = false
+
+[governance]
+provider_approval_path = ""
+
+[shadow]
+enabled = false
+execution_mode = "shadow"
+allow_live_orders = false
+config_version = "btc-control-read-only-v1"
+
+[products.btc]
+enabled = true
+series_tickers = ["KXBTC15M"]
+ticker_prefixes = ["KXBTC15M"]
+title_keywords = ["bitcoin", "btc"]
+pyth_symbol = ""
+pyth_feed_id = ""
+cme_symbols = []

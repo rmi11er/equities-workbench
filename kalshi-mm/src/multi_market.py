@@ -25,7 +25,7 @@ from .orderbook import OrderBookManager
 from .strategy import StoikovStrategy, AlphaEngine
 from .pegged import PeggedStrategy
 from .taker import ImpulseEngine, BailoutAction
-from .types import Position, StrategyOutput
+from .types import Position, StrategyOutput, QuoteLadder
 from .liquidity import analyze_liquidity, compute_adaptive_params
 from .lip import LIPManager, LIPConstraints
 from .decision_log import (
@@ -34,7 +34,7 @@ from .decision_log import (
     MarketState, PositionState, LatencyBreakdown,
 )
 from .fill_logger import FillLogger
-from .volatility_regime import VolatilityRegime, VolatilityRegimeConfig
+from .volatility_regime import VolatilityRegime, VolatilityRegimeConfig, extract_market_root
 
 if TYPE_CHECKING:
     from .run_context import RunContext
@@ -133,6 +133,100 @@ class MultiMarketOrchestrator:
         """Get list of tickers being traded."""
         return list(self._markets.keys())
 
+    def _get_aggregate_inventory(self, ticker: str) -> int:
+        """
+        Get NET aggregate inventory across synthetically equivalent markets.
+
+        ONLY aggregates GAME markets (true binary outcomes where one team wins).
+        For GAME markets: Long TEAM-X + Long TEAM-Y = hedged (net 0)
+
+        Does NOT aggregate:
+        - SPREAD markets: Different lines (LA-9 vs LA-10) are correlated, not opposite.
+                          Even opposite teams (GB-2 vs CHI+2) have nuanced push scenarios.
+        - TOTAL markets: Over/under lines have similar complexity.
+        - Other markets: MVP, COTY, etc. are independent.
+
+        Example: Long 100 GAME-CHI + Long 100 GAME-GB = 0 net exposure (hedged)
+        Example: Long 100 SPREAD-LA9 + Long 100 SPREAD-LA10 = each treated independently
+        """
+        ctx = self._markets.get(ticker)
+        local_position = ctx.position.net_position if ctx else 0
+
+        # Only aggregate GAME markets (true binary outcomes)
+        if "GAME" not in ticker:
+            return local_position
+
+        root = extract_market_root(ticker)
+
+        # Find all GAME tickers with same root
+        related = [(t, ctx.position.net_position)
+                   for t, ctx in self._markets.items()
+                   if "GAME" in t and extract_market_root(t) == root]
+
+        if len(related) <= 1:
+            # Single market or no related - return as-is
+            return local_position
+
+        # Sort by ticker name - first is reference (counts positive)
+        related.sort(key=lambda x: x[0])
+
+        # Reference ticker counts positive, all others count negative (offsetting)
+        reference_ticker = related[0][0]
+        net = 0
+        for t, pos in related:
+            if t == reference_ticker:
+                net += pos
+            else:
+                net -= pos  # Opposite bet, so subtract
+
+        return net
+
+    async def _load_positions(self) -> None:
+        """Load existing positions from exchange on startup."""
+        try:
+            resp = await self.connector.get_positions()
+            positions = resp.get("market_positions", [])
+
+            loaded_count = 0
+            our_tickers = set(self._markets.keys())
+            for pos in positions:
+                ticker = pos.get("ticker")
+                if ticker not in our_tickers:
+                    continue
+
+                # Parse position data
+                # Kalshi returns: position (net contracts, + for yes, - for no)
+                net_pos = pos.get("position", 0)
+
+                ctx = self._markets[ticker]
+                if net_pos >= 0:
+                    ctx.position.yes_contracts = net_pos
+                    ctx.position.no_contracts = 0
+                else:
+                    ctx.position.yes_contracts = 0
+                    ctx.position.no_contracts = abs(net_pos)
+
+                if net_pos != 0:
+                    loaded_count += 1
+                    logger.warning(
+                        f"[{ticker}] LOADED POSITION: {net_pos} contracts"
+                    )
+
+            logger.info(f"Loaded {loaded_count} existing positions for our markets")
+
+            # Log aggregate positions for each market root (shows offsetting)
+            roots_seen = set()
+            for ticker in self._markets.keys():
+                root = extract_market_root(ticker)
+                if root not in roots_seen:
+                    roots_seen.add(root)
+                    agg = self._get_aggregate_inventory(ticker)
+                    if agg != 0:
+                        logger.info(f"  Aggregate for root {root}: {agg}")
+
+        except Exception as e:
+            logger.error(f"Failed to load positions: {e}", exc_info=True)
+
     # -------------------------------------------------------------------------
     # Lifecycle
     # -------------------------------------------------------------------------
@@ -148,6 +242,9 @@ class MultiMarketOrchestrator:
 
         # Start connector
         await self.connector.start()
+
+        # Load existing positions from exchange
+        await self._load_positions()
 
         # CRITICAL: Cancel any stale orders from previous runs
         # This prevents stale orders from executing at bad prices
@@ -345,7 +442,56 @@ class MultiMarketOrchestrator:
             inventory_after=inventory_after,
         )
 
-        # Update execution engine state
+        # Check for canary death BEFORE updating state (v2.2 layering)
+        layer_index = None
+        if self.config.layering.enabled:
+            # Get the filled order's layer index and check for canary death
+            layered_state = self.execution._layered_quotes.get(ticker)
+            if layered_state:
+                # Find the order in layered state to get layer_index and created_at
+                filled_order = None
+                for layer_idx, order in layered_state.bid_orders.items():
+                    if order and order.order_id == order_id:
+                        filled_order = order
+                        layer_index = layer_idx
+                        break
+                if filled_order is None:
+                    for layer_idx, order in layered_state.ask_orders.items():
+                        if order and order.order_id == order_id:
+                            filled_order = order
+                            layer_index = layer_idx
+                            break
+
+                # Check for canary death (layer 0 fill within timeout)
+                if filled_order and layer_index == 0:  # CANARY layer
+                    from datetime import datetime
+                    lifespan_ms = (datetime.now() - filled_order.created_at).total_seconds() * 1000
+                    canary_timeout = self.config.layering.canary_timeout_ms
+
+                    if lifespan_ms < canary_timeout:
+                        # CANARY DEATH - toxic sweep detected!
+                        logger.critical(
+                            f"[{ticker}] CANARY DEATH: filled in {lifespan_ms:.0f}ms "
+                            f"(threshold: {canary_timeout}ms) - TOXIC SWEEP DETECTED"
+                        )
+                        from .volatility_regime import HighVolReason
+                        self.volatility_regime.activate_high_vol(ticker, HighVolReason.CANARY_DEATH)
+                    else:
+                        logger.info(
+                            f"[{ticker}] Canary fill (lifespan: {lifespan_ms:.0f}ms) - normal"
+                        )
+
+            # Update layered execution state
+            layer_index = self.execution.handle_layer_fill(
+                ticker=ticker,
+                order_id=order_id,
+                side=side,
+                price=yes_price,
+                size=count,
+                inventory_before=inventory_before,
+            )
+
+        # Update single-quote execution engine state (for backward compatibility)
         self.execution.handle_fill(
             ticker=ticker,
             order_id=order_id,
@@ -545,14 +691,26 @@ class MultiMarketOrchestrator:
                     current_bid_size=current_bid_size,
                     current_ask_size=current_ask_size,
                 )
-                should_bid, should_ask = self.pegged_strategy.should_quote(inventory)
+                # Use aggregate inventory for synthetic equivalence
+                aggregate_inv = self._get_aggregate_inventory(ticker)
+                should_bid, should_ask = self.pegged_strategy.should_quote(aggregate_inv)
+
+                # Only log when limit is hit
+                if not should_bid or not should_ask:
+                    max_exp = self.config.pegged_mode.max_exposure
+                    logger.warning(
+                        f"[{ticker}] PEGGED INVENTORY LIMIT: {aggregate_inv} (max={max_exp}), "
+                        f"bid={should_bid}, ask={should_ask}"
+                    )
             else:
                 if liq_metrics.is_empty:
+                    # Empty book: use max order size in dollars, convert at mid=50
+                    empty_book_size = int(self.config.strategy.max_order_size_dollars / 0.50)
                     quotes = StrategyOutput(
                         bid_price=1,
                         ask_price=99,
-                        bid_size=self.config.strategy.max_order_size,
-                        ask_size=self.config.strategy.max_order_size,
+                        bid_size=empty_book_size,
+                        ask_size=empty_book_size,
                         reservation_price=50.0,
                         spread=98.0,
                         inventory_skew=0.0,
@@ -581,9 +739,12 @@ class MultiMarketOrchestrator:
                     new_bid_size = max(1, int(quotes.bid_size * adaptive.size_multiplier))
                     new_ask_size = max(1, int(quotes.ask_size * adaptive.size_multiplier))
 
-                    max_size = self.config.strategy.max_order_size
-                    new_bid_size = min(new_bid_size, max_size)
-                    new_ask_size = min(new_ask_size, max_size)
+                    # Convert max order size from dollars to contracts at ADJUSTED prices
+                    # Must use new_bid/new_ask (not quotes.bid_price) since those are the actual quote prices
+                    max_bid_contracts = int(self.config.strategy.max_order_size_dollars / (new_bid / 100)) if new_bid > 0 else 100
+                    max_ask_contracts = int(self.config.strategy.max_order_size_dollars / (new_ask / 100)) if new_ask > 0 else 100
+                    new_bid_size = min(new_bid_size, max_bid_contracts)
+                    new_ask_size = min(new_ask_size, max_ask_contracts)
 
                     quotes = StrategyOutput(
                         bid_price=new_bid,
@@ -595,7 +756,30 @@ class MultiMarketOrchestrator:
                         inventory_skew=quotes.inventory_skew,
                     )
 
-                should_bid, should_ask = self.strategy.should_quote(inventory)
+                # Use aggregate inventory for synthetic equivalence
+                aggregate_inv = self._get_aggregate_inventory(ticker)
+                should_bid, should_ask = self.strategy.should_quote(aggregate_inv, mid_price=effective_mid)
+
+                # Log when limit is hit OR positions are offsetting (for debugging)
+                max_inv_dollars = self.config.strategy.max_inventory_dollars
+                if aggregate_inv >= 0:
+                    price_for_exposure = effective_mid
+                else:
+                    price_for_exposure = 100.0 - effective_mid
+                exposure_dollars = abs(aggregate_inv) * (price_for_exposure / 100)
+
+                if not should_bid or not should_ask:
+                    logger.warning(
+                        f"[{ticker}] INVENTORY LIMIT: local={inventory}, agg={aggregate_inv}, "
+                        f"exposure=${exposure_dollars:.0f} (max=${max_inv_dollars}), "
+                        f"bid={should_bid}, ask={should_ask}"
+                    )
+                elif aggregate_inv != inventory and inventory != 0:
+                    # Log when positions are offsetting (once per market with position)
+                    logger.info(
+                        f"[{ticker}] OFFSET: local={inventory}, agg={aggregate_inv}, "
+                        f"exposure=${exposure_dollars:.0f}"
+                    )
         latency_tracker.record_strategy_calc(t.elapsed_us)
 
         # Store reservation price
@@ -610,11 +794,41 @@ class MultiMarketOrchestrator:
             min_depth=min_depth,
         )
 
+        # Recalculate size caps at clamped prices (clamping can move prices up toward BBO)
+        max_order_dollars = self.config.strategy.max_order_size_dollars
+        clamped_bid_size = quotes.bid_size
+        clamped_ask_size = quotes.ask_size
+        if clamped_bid > 0:
+            max_bid_at_clamped = int(max_order_dollars / (clamped_bid / 100))
+            clamped_bid_size = min(clamped_bid_size, max(1, max_bid_at_clamped))
+        if clamped_ask > 0:
+            max_ask_at_clamped = int(max_order_dollars / (clamped_ask / 100))
+            clamped_ask_size = min(clamped_ask_size, max(1, max_ask_at_clamped))
+
+        # Enforce min_absolute_spread as floor, but ONLY if we can stay at/behind BBO
+        # Don't widen past BBO to empty levels where we'd be alone at front
+        min_spread = self.config.strategy.min_absolute_spread
+        if clamped_ask - clamped_bid < min_spread:
+            half_widen = (min_spread - (clamped_ask - clamped_bid)) / 2.0
+            widened_bid = max(1, int(clamped_bid - half_widen))
+            widened_ask = min(99, int(clamped_ask + half_widen))
+
+            # Don't go past BBO - that would put us alone at front
+            if best_bid is not None:
+                widened_bid = max(widened_bid, best_bid)  # Stay at or behind best bid
+            if best_ask is not None:
+                widened_ask = min(widened_ask, best_ask)  # Stay at or behind best ask
+
+            # Only apply widening if we still have a valid spread
+            if widened_ask > widened_bid:
+                clamped_bid = widened_bid
+                clamped_ask = widened_ask
+
         quotes = StrategyOutput(
             bid_price=clamped_bid,
             ask_price=clamped_ask,
-            bid_size=quotes.bid_size,
-            ask_size=quotes.ask_size,
+            bid_size=clamped_bid_size,
+            ask_size=clamped_ask_size,
             reservation_price=quotes.reservation_price,
             spread=float(clamped_ask - clamped_bid),
             inventory_skew=quotes.inventory_skew,
@@ -649,12 +863,77 @@ class MultiMarketOrchestrator:
                 if book.yes_asks:
                     book_depth.update(book.yes_asks)
             self.execution.set_market_state(ticker, best_bid, best_ask, book_depth)
-            await self.execution.update_quotes(
-                ticker=ticker,
-                target=quotes,
-                should_bid=should_bid,
-                should_ask=should_ask,
-            )
+
+            # v2.2 Layering: use multi-layer quote ladder
+            if self.config.layering.enabled and not self.config.pegged_mode.enabled:
+                is_high_vol = self.volatility_regime.is_high_vol(ticker)
+                ladder = self.strategy.generate_ladder(
+                    mid_price=effective_mid,
+                    inventory=inventory,
+                    volatility=volatility,
+                    layering_config=self.config.layering,
+                    is_high_vol=is_high_vol,
+                    external_skew=external_skew,
+                    expiry_ts=ctx.market_expiry_ts,
+                )
+
+                # Adjust ladder to use depth-clamped prices and sizes from quotes
+                # The clamped quotes (from book.clamp_quotes_to_depth) should be
+                # the tightest prices we quote - use them as Layer 0 anchors
+                if ladder.bids and ladder.asks:
+                    tick_step = self.config.layering.base_tick_step
+                    if is_high_vol:
+                        tick_step = int(tick_step * self.config.layering.high_vol_spread_multiplier)
+
+                    # Use the already-computed quote sizes as base (these respect max_order)
+                    base_bid_size = quotes.bid_size
+                    base_ask_size = quotes.ask_size
+
+                    # Size ratios per layer
+                    size_ratios = {
+                        0: self.config.layering.canary_size_ratio,
+                        1: self.config.layering.body_size_ratio,
+                        2: self.config.layering.wall_size_ratio,
+                    }
+
+                    # Rebase all layers from clamped prices and recalculate sizes
+                    clamped_bid = quotes.bid_price
+                    clamped_ask = quotes.ask_price
+                    max_order_dollars = self.config.strategy.max_order_size_dollars
+
+                    for i, bid_level in enumerate(ladder.bids):
+                        bid_level.price = max(1, clamped_bid - (i * tick_step))
+                        ratio = size_ratios.get(i, 1.0)
+                        layer_size = max(1, int(base_bid_size * ratio))
+                        # Cap to max_order_size_dollars at this price
+                        max_contracts = int(max_order_dollars / (bid_level.price / 100)) if bid_level.price > 0 else 100
+                        bid_level.size = min(layer_size, max(1, max_contracts))
+
+                    for i, ask_level in enumerate(ladder.asks):
+                        ask_level.price = min(99, clamped_ask + (i * tick_step))
+                        ratio = size_ratios.get(i, 1.0)
+                        layer_size = max(1, int(base_ask_size * ratio))
+                        # Cap to max_order_size_dollars at this price
+                        max_contracts = int(max_order_dollars / (ask_level.price / 100)) if ask_level.price > 0 else 100
+                        ask_level.size = min(layer_size, max(1, max_contracts))
+
+                    # Update ladder reservation price to match clamped quotes
+                    ladder.reservation_price = quotes.reservation_price
+
+                await self.execution.update_ladder(
+                    ticker=ticker,
+                    ladder=ladder,
+                    should_bid=should_bid,
+                    should_ask=should_ask,
+                )
+            else:
+                # Single-quote mode (original behavior)
+                await self.execution.update_quotes(
+                    ticker=ticker,
+                    target=quotes,
+                    should_bid=should_bid,
+                    should_ask=should_ask,
+                )
         latency_tracker.record_execution(t.elapsed_us)
 
         latency_breakdown = latency_tracker.finalize()
@@ -704,12 +983,20 @@ class MultiMarketOrchestrator:
 
         new_bid_price = quotes.bid_price
         new_ask_price = quotes.ask_price
-        new_bid_size = max(quotes.bid_size, constraints.min_size)
-        new_ask_size = max(quotes.ask_size, constraints.min_size)
 
-        max_size = self.config.strategy.max_order_size
-        new_bid_size = min(new_bid_size, max_size)
-        new_ask_size = min(new_ask_size, max_size)
+        # Only enforce LIP min_size if configured to do so
+        if self.config.lip.enforce_min_size:
+            new_bid_size = max(quotes.bid_size, constraints.min_size)
+            new_ask_size = max(quotes.ask_size, constraints.min_size)
+        else:
+            new_bid_size = quotes.bid_size
+            new_ask_size = quotes.ask_size
+
+        # Convert max order size from dollars to contracts at current prices
+        max_bid_contracts = int(self.config.strategy.max_order_size_dollars / (new_bid_price / 100)) if new_bid_price > 0 else 100
+        max_ask_contracts = int(self.config.strategy.max_order_size_dollars / (new_ask_price / 100)) if new_ask_price > 0 else 100
+        new_bid_size = min(new_bid_size, max_bid_contracts)
+        new_ask_size = min(new_ask_size, max_ask_contracts)
 
         if best_bid is not None:
             min_bid = best_bid - constraints.max_distance

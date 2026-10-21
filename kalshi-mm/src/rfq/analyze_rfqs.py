@@ -7,10 +7,11 @@ Kalshi API for additional outcome data.
 Usage:
     python -m src.rfq.analyze_rfqs logs/rfq/decisions_20250115_120000.jsonl
     python -m src.rfq.analyze_rfqs logs/rfq/ --all-sessions
-    python -m src.rfq.analyze_rfqs logs/rfq/decisions_*.jsonl --query-api
+    python -m src.rfq.analyze_rfqs --lookup <rfq_id> --config config_rfq.toml
 """
 
 import argparse
+import asyncio
 import json
 import sys
 from collections import defaultdict
@@ -54,14 +55,45 @@ class SessionStats:
         return self.executed / self.quoted if self.quoted > 0 else 0.0
 
 
-def load_decisions(path: Path) -> list[dict]:
-    """Load decisions from a JSONL file."""
+def load_decisions(path: Path, sports_filter: list[str] = None) -> list[dict]:
+    """Load decisions from a JSONL file, optionally filtering by sport.
+
+    Args:
+        path: Path to JSONL file
+        sports_filter: List of sport codes to include (e.g., ["NFL", "NBA"]).
+                      If None or empty, all decisions are included.
+    """
     decisions = []
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
-            if line:
-                decisions.append(json.loads(line))
+            if not line:
+                continue
+
+            d = json.loads(line)
+
+            # Apply sports filter if specified
+            if sports_filter:
+                legs = d.get("legs", [])
+                if not legs:
+                    continue  # Skip if no legs data
+
+                # Check if any leg matches the sport filter
+                sport_match = False
+                for leg in legs:
+                    ticker = leg.get("market_ticker", "") or leg.get("event_ticker", "")
+                    ticker_upper = ticker.upper()
+                    for sport in sports_filter:
+                        if sport.upper() in ticker_upper:
+                            sport_match = True
+                            break
+                    if sport_match:
+                        break
+
+                if not sport_match:
+                    continue  # Skip this decision
+
+            decisions.append(d)
     return decisions
 
 
@@ -78,12 +110,12 @@ def load_outcomes(path: Path) -> list[dict]:
     return outcomes
 
 
-def analyze_session(decisions_path: Path) -> SessionStats:
+def analyze_session(decisions_path: Path, sports_filter: list[str] = None) -> SessionStats:
     """Analyze a single session's decision log."""
     stats = SessionStats()
 
-    # Load decisions
-    decisions = load_decisions(decisions_path)
+    # Load decisions (with optional sport filtering)
+    decisions = load_decisions(decisions_path, sports_filter)
     stats.total_rfqs = len(decisions)
 
     # Build decision lookup by RFQ ID
@@ -186,6 +218,116 @@ def find_session_files(log_dir: Path) -> list[Path]:
     return sorted(log_dir.glob("decisions_*.jsonl"))
 
 
+async def lookup_rfq(rfq_id: str, config_path: str) -> int:
+    """Query Kalshi API to look up an RFQ and its quotes."""
+    from .config import load_rfq_config
+    from ..config import Config, CredentialsConfig as MMCredentialsConfig, RateLimitConfig, LoggingConfig as MMLoggingConfig
+    from ..connector import KalshiConnector, APIError
+
+    # Load config for credentials
+    config = load_rfq_config(config_path)
+
+    # Build connector config
+    connector_config = Config(
+        environment=config.environment,
+        credentials=MMCredentialsConfig(
+            api_key_id=config.credentials.api_key_id,
+            private_key_path=config.credentials.private_key_path,
+        ),
+        rate_limit=RateLimitConfig(read_rate=20, write_rate=10),
+        logging=MMLoggingConfig(log_level="WARNING"),
+    )
+
+    connector = KalshiConnector(connector_config)
+
+    try:
+        async with connector.session():
+            print(f"\n{'='*60}")
+            print(f"  RFQ Lookup: {rfq_id}")
+            print(f"  Environment: {config.environment.name}")
+            print(f"{'='*60}")
+
+            rfq_creator_user_id = None
+
+            # Try to get RFQ details first
+            print("\n--- RFQ Details ---")
+            try:
+                resp = await connector._request(
+                    "GET",
+                    f"/communications/rfqs/{rfq_id}"
+                )
+                # Response is nested under 'rfq' key
+                rfq_result = resp.get('rfq', resp)
+
+                # Print all fields for transparency
+                print(f"  Status:          {rfq_result.get('status', 'N/A')}")
+                print(f"  Contracts:       {rfq_result.get('contracts', 'N/A')}")
+                print(f"  Collection:      {rfq_result.get('mve_collection_ticker', 'N/A')}")
+                print(f"  Market Ticker:   {rfq_result.get('market_ticker', 'N/A')}")
+                print(f"  Created:         {rfq_result.get('created_ts', 'N/A')}")
+
+                # Show execution fields if present
+                if rfq_result.get('execution_price'):
+                    print(f"  Execution Price: {rfq_result.get('execution_price')}")
+                if rfq_result.get('executed_ts'):
+                    print(f"  Executed:        {rfq_result.get('executed_ts')}")
+                if rfq_result.get('expiration_ts'):
+                    print(f"  Expires:         {rfq_result.get('expiration_ts')}")
+
+                # Get creator user ID for quote lookup
+                rfq_creator_user_id = rfq_result.get('creator_id') or rfq_result.get('creator_user_id') or rfq_result.get('user_id')
+
+                # Print legs if available
+                legs = rfq_result.get('mve_selected_legs', [])
+                if legs:
+                    print(f"  Legs ({len(legs)}):")
+                    for leg in legs:
+                        ticker = leg.get('market_ticker', 'N/A')
+                        side = leg.get('side', 'N/A')
+                        print(f"    - {ticker} ({side})")
+
+                # Query trades on the combo market to see if it was filled
+                market_ticker = rfq_result.get('market_ticker')
+                if market_ticker:
+                    print(f"\n--- Market Trades ({market_ticker}) ---")
+                    try:
+                        trades_resp = await connector._request(
+                            "GET",
+                            f"/markets/{market_ticker}/trades"
+                        )
+                        trades = trades_resp.get("trades", [])
+
+                        if not trades:
+                            print("  No trades - RFQ expired unfilled")
+                        else:
+                            print(f"  {len(trades)} trade(s) found:")
+                            for i, trade in enumerate(trades, 1):
+                                price = trade.get('yes_price') or trade.get('price')
+                                count = trade.get('count') or trade.get('contracts')
+                                ts = trade.get('created_time') or trade.get('ts')
+                                taker_side = trade.get('taker_side', 'N/A')
+                                print(f"    {i}. {count} contracts @ {price} ({taker_side}) - {ts}")
+                    except APIError as e:
+                        if e.status == 404:
+                            print("  Market not found (may have been delisted)")
+                        else:
+                            print(f"  Could not fetch trades: {e.status}")
+
+            except APIError as e:
+                if e.status == 404:
+                    print("  RFQ not found (may have expired or ID is invalid)")
+                else:
+                    print(f"  Could not fetch RFQ details: {e.status} {e.response}")
+
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze RFQ decision logs",
@@ -195,6 +337,8 @@ def main():
     parser.add_argument(
         "path",
         type=Path,
+        nargs="?",
+        default=None,
         help="Path to decisions JSONL file or log directory",
     )
     parser.add_argument(
@@ -212,8 +356,38 @@ def main():
         action="store_true",
         help="Output as JSON",
     )
+    parser.add_argument(
+        "--lookup",
+        type=str,
+        metavar="RFQ_ID",
+        help="Look up a specific RFQ by ID via Kalshi API",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config_rfq.toml",
+        help="Path to RFQ config file (for API credentials, default: config_rfq.toml)",
+    )
+    parser.add_argument(
+        "--sport",
+        type=str,
+        action="append",
+        metavar="CODE",
+        help="Filter by sport code (e.g., --sport NFL --sport NBA). Can be used multiple times.",
+    )
 
     args = parser.parse_args()
+
+    # Handle --lookup mode
+    if args.lookup:
+        return asyncio.run(lookup_rfq(args.lookup, args.config))
+
+    # Require path for analysis mode
+    if args.path is None:
+        print("Error: path is required for analysis mode", file=sys.stderr)
+        print("Usage: python -m src.rfq.analyze_rfqs <path>", file=sys.stderr)
+        print("   or: python -m src.rfq.analyze_rfqs --lookup <rfq_id>", file=sys.stderr)
+        return 1
 
     # Find files to analyze
     if args.path.is_dir():
@@ -233,10 +407,14 @@ def main():
         print(f"Analyzing most recent session: {files[0].name}")
         print("(Use --all-sessions to analyze all)")
 
+    # Show sport filter if active
+    if args.sport:
+        print(f"Sport filter: {', '.join(args.sport)}")
+
     # Analyze each session
     all_stats = []
     for f in files:
-        stats = analyze_session(f)
+        stats = analyze_session(f, sports_filter=args.sport)
         all_stats.append((f.stem, stats))
 
         if not args.summary:

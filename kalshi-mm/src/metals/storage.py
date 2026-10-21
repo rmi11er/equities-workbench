@@ -61,10 +61,17 @@ class HashChainedJsonlWriter:
     def close(self) -> None:
         if not self._handle.closed:
             try:
-                self._handle.flush()
-                os.fsync(self._handle.fileno())
+                self.sync()
             finally:
                 self._handle.close()
+
+    def sync(self) -> None:
+        """Flush and fsync the current append-only segment."""
+
+        if not self._handle.closed:
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+            self._records_since_fsync = 0
 
     def __enter__(self) -> "HashChainedJsonlWriter":
         return self
@@ -137,6 +144,19 @@ class PartitionedRawStore:
         for writer in self._writers.values():
             try:
                 writer.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def sync(self) -> None:
+        """Durably flush every currently open segment."""
+
+        first_error: Optional[BaseException] = None
+        for writer in self._writers.values():
+            try:
+                writer.sync()
             except BaseException as error:
                 if first_error is None:
                     first_error = error

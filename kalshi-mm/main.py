@@ -82,11 +82,19 @@ def is_rfq_config(config_path: Path) -> bool:
 
 async def run_rfq(args) -> int:
     """Run RFQ Responder."""
+    import logging
     from src.rfq import load_rfq_config, RFQResponder
 
     config_path = Path(args.config)
     print(f"Loading RFQ config from {config_path}")
     config = load_rfq_config(str(config_path))
+
+    # Setup logging based on config
+    logging.basicConfig(
+        level=getattr(logging, config.logging.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
     # Apply environment override
     if args.env:
@@ -99,18 +107,26 @@ async def run_rfq(args) -> int:
         return 1
 
     # Print startup info
+    mode_str = "SHADOW" if config.is_shadow_mode else "LIVE"
     print(f"\n{'='*60}")
-    print("  RFQ RESPONDER")
+    print(f"  RFQ RESPONDER ({mode_str})")
     print(f"{'='*60}")
     print(f"  Environment: {config.environment.name}")
-    print(f"  Leg Tickers: {len(config.leg_tickers)}")
-    print(f"  Spread: {config.pricing.default_spread_pct*100:.1f}%")
+    print(f"  Mode: {mode_str}")
+    if config.is_shadow_mode:
+        print(f"  Shadow spread multiplier: {config.shadow.spread_multiplier}x")
+    print(f"  Leg Tickers: {len(config.leg_tickers)} (dynamic subscription if 0)")
+    print(f"  Liquidity: ${config.pricing.min_bbo_liquidity_dollars} min, {config.pricing.max_bbo_spread_cents}c max spread")
     print(f"  Max Exposure: ${config.risk.max_exposure_dollars:.0f}")
     print(f"  Max Active Quotes: {config.risk.max_active_quotes}")
     print(f"  Filters:")
     print(f"    - Dollar range: ${config.filters.min_dollars:.0f} - ${config.filters.max_dollars:.0f}")
     print(f"    - Leg range: {config.filters.min_legs} - {config.filters.max_legs}")
-    print(f"{'='*60}\n")
+    if config.filters.allowed_sports:
+        print(f"    - Sports: {config.filters.allowed_sports}")
+    print(f"{'='*60}")
+
+    print("\nConnecting to Kalshi...")
 
     # Create responder
     responder = RFQResponder(config)

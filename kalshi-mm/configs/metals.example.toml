@@ -47,6 +47,28 @@ mbo_snapshot = true
 reconnect_policy = "reconnect"
 include_ts_out = true
 
+# Required for synchronized research collection. Chrony must already be
+# configured by the host; this collector only reads local daemon state.
+[clock]
+enabled = false
+provider = "chrony"
+chronyc_path = "chronyc"
+sample_interval_seconds = 1.0
+probe_timeout_seconds = 2.0
+max_probe_elapsed_delta_ns = 1000000
+
+# Must point inside [storage].root to a content-addressed artifact created by
+# materialize-provider-approval before Pyth or Databento collection is enabled.
+[governance]
+provider_approval_path = ""
+# These operation-specific artifacts are accepted only for historical exploratory
+# downloads when provider_approval_path is empty. They cannot authorize live data,
+# synchronized collection, shadow execution, or daily readiness. Use them only with
+# a separate exploratory [storage].root; never mix assumption-acquired checkpoints
+# into the production settlement/readiness root.
+pyth_historical_research_assumption_path = ""
+databento_historical_research_assumption_path = ""
+
 # Research limits agreed for counterfactual shadow orders. These are not
 # production approvals, and this subsystem has no live-order route.
 [shadow]
